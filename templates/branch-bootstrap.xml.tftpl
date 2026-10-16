@@ -1,0 +1,240 @@
+<?xml version="1.0"?>
+<!--
+  PAN-OS bootstrap configuration - ${hostname} (standalone branch firewall)
+
+  Interface map (AWS ENI device index -> PAN-OS interface):
+    eth0 -> management   : admin/API access, licensing, content updates
+    eth1 -> ethernet1/1  : untrust / internet side, IPsec endpoint (DHCP from AWS)
+    eth2 -> ethernet1/2  : trust / inside (DHCP from AWS)
+
+  The IPsec tunnel to the HA pair (tunnel.1, zone "vpn", IKE gateway, crypto
+  profiles, the route to the security VPC and the VPN rules) is not here:
+  scripts/configure.py adds it over the XML API, which encrypts the
+  pre-shared key, and configures the pair's end the same way.
+-->
+<config version="${config_version}" urldb="paloaltonetworks">
+  <mgt-config>
+    <users>
+      <entry name="${admin_username}">
+        <phash>${admin_phash}</phash>
+        <permissions>
+          <role-based>
+            <superuser>yes</superuser>
+          </role-based>
+        </permissions>
+      </entry>
+%{ if admin_username != "admin" ~}
+      <!-- Key-only break-glass account; see bootstrap.xml.tftpl. -->
+      <entry name="admin">
+        <public-key>${admin_public_key}</public-key>
+        <permissions>
+          <role-based>
+            <superuser>yes</superuser>
+          </role-based>
+        </permissions>
+      </entry>
+%{ endif ~}
+    </users>
+  </mgt-config>
+  <shared/>
+  <devices>
+    <entry name="localhost.localdomain">
+      <deviceconfig>
+        <system>
+          <hostname>${hostname}</hostname>
+          <timezone>${timezone}</timezone>
+          <type>
+            <dhcp-client>
+              <send-hostname>yes</send-hostname>
+              <send-client-id>yes</send-client-id>
+              <accept-dhcp-hostname>no</accept-dhcp-hostname>
+              <accept-dhcp-domain>yes</accept-dhcp-domain>
+            </dhcp-client>
+          </type>
+          <dns-setting>
+            <servers>
+              <primary>169.254.169.253</primary>
+              <secondary>1.1.1.1</secondary>
+            </servers>
+          </dns-setting>
+          <ntp-servers>
+            <primary-ntp-server>
+              <ntp-server-address>169.254.169.123</ntp-server-address>
+            </primary-ntp-server>
+            <secondary-ntp-server>
+              <ntp-server-address>time.google.com</ntp-server-address>
+            </secondary-ntp-server>
+          </ntp-servers>
+          <update-server>updates.paloaltonetworks.com</update-server>
+          <server-verification>yes</server-verification>
+          <service>
+            <disable-telnet>yes</disable-telnet>
+            <disable-http>yes</disable-http>
+          </service>
+%{ if length(permitted_ips) > 0 ~}
+          <permitted-ip>
+%{ for cidr in permitted_ips ~}
+            <entry name="${cidr}"/>
+%{ endfor ~}
+          </permitted-ip>
+%{ endif ~}
+        </system>
+      </deviceconfig>
+
+      <network>
+        <interface>
+          <ethernet>
+            <!-- eth1: untrust, IPsec endpoint -->
+            <entry name="ethernet1/1">
+              <layer3>
+                <dhcp-client>
+                  <enable>yes</enable>
+                  <create-default-route>no</create-default-route>
+                </dhcp-client>
+                <interface-management-profile>mgmt-ping</interface-management-profile>
+              </layer3>
+            </entry>
+            <!-- eth2: trust -->
+            <entry name="ethernet1/2">
+              <layer3>
+                <dhcp-client>
+                  <enable>yes</enable>
+                  <create-default-route>no</create-default-route>
+                </dhcp-client>
+                <interface-management-profile>mgmt-ping</interface-management-profile>
+              </layer3>
+            </entry>
+          </ethernet>
+        </interface>
+
+        <profiles>
+          <interface-management-profile>
+            <!-- Also applied to tunnel.1 by configure.py: the pair's tunnel
+                 interface answers the branch's tunnel-monitor pings with it. -->
+            <entry name="mgmt-ping">
+              <ping>yes</ping>
+            </entry>
+          </interface-management-profile>
+        </profiles>
+
+        <virtual-router>
+          <entry name="default">
+            <interface>
+              <member>ethernet1/1</member>
+              <member>ethernet1/2</member>
+            </interface>
+            <routing-table>
+              <ip>
+                <static-route>
+                  <entry name="default">
+                    <destination>0.0.0.0/0</destination>
+                    <interface>ethernet1/1</interface>
+                    <nexthop>
+                      <ip-address>${untrust_gateway}</ip-address>
+                    </nexthop>
+                    <metric>10</metric>
+                  </entry>
+                  <entry name="vpc-inside">
+                    <destination>${branch_cidr}</destination>
+                    <interface>ethernet1/2</interface>
+                    <nexthop>
+                      <ip-address>${trust_gateway}</ip-address>
+                    </nexthop>
+                    <metric>10</metric>
+                  </entry>
+                </static-route>
+              </ip>
+            </routing-table>
+          </entry>
+        </virtual-router>
+      </network>
+
+      <vsys>
+        <entry name="vsys1">
+          <import>
+            <network>
+              <interface>
+                <member>ethernet1/1</member>
+                <member>ethernet1/2</member>
+              </interface>
+            </network>
+          </import>
+
+          <zone>
+            <entry name="untrust">
+              <network>
+                <layer3>
+                  <member>ethernet1/1</member>
+                </layer3>
+              </network>
+            </entry>
+            <entry name="trust">
+              <network>
+                <layer3>
+                  <member>ethernet1/2</member>
+                </layer3>
+              </network>
+            </entry>
+          </zone>
+
+          <!-- Every rule carries a stable uuid; see bootstrap.xml.tftpl. -->
+          <rulebase>
+            <nat>
+              <rules>
+                <entry name="outbound-snat" uuid="${uuidv5("url", "urn:panw-ha:branch:nat:outbound-snat")}">
+                  <description>Egress: SNAT trust -> untrust</description>
+                  <from><member>trust</member></from>
+                  <to><member>untrust</member></to>
+                  <source><member>any</member></source>
+                  <destination><member>any</member></destination>
+                  <service>any</service>
+                  <to-interface>ethernet1/1</to-interface>
+                  <source-translation>
+                    <dynamic-ip-and-port>
+                      <interface-address>
+                        <interface>ethernet1/1</interface>
+                      </interface-address>
+                    </dynamic-ip-and-port>
+                  </source-translation>
+                </entry>
+              </rules>
+            </nat>
+
+            <security>
+              <rules>
+                <entry name="allow-outbound" uuid="${uuidv5("url", "urn:panw-ha:branch:security:allow-outbound")}">
+                  <description>Workload egress to the internet</description>
+                  <from><member>trust</member></from>
+                  <to><member>untrust</member></to>
+                  <source><member>any</member></source>
+                  <destination><member>any</member></destination>
+                  <source-user><member>any</member></source-user>
+                  <application><member>any</member></application>
+                  <service><member>any</member></service>
+                  <category><member>any</member></category>
+                  <action>allow</action>
+                  <log-start>no</log-start>
+                  <log-end>yes</log-end>
+                </entry>
+
+                <entry name="deny-all" uuid="${uuidv5("url", "urn:panw-ha:branch:security:deny-all")}">
+                  <description>Default deny with logging</description>
+                  <from><member>any</member></from>
+                  <to><member>any</member></to>
+                  <source><member>any</member></source>
+                  <destination><member>any</member></destination>
+                  <source-user><member>any</member></source-user>
+                  <application><member>any</member></application>
+                  <service><member>any</member></service>
+                  <category><member>any</member></category>
+                  <action>deny</action>
+                  <log-end>yes</log-end>
+                </entry>
+              </rules>
+            </security>
+          </rulebase>
+        </entry>
+      </vsys>
+    </entry>
+  </devices>
+</config>

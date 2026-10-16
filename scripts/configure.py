@@ -13,6 +13,14 @@ in bootstrap.xml and are done here, over the PAN-OS XML API:
   2. Verification: licensing state, HA1/HA2 link state, peer sync, and that
      the workload route tables actually point at the active node's trust ENI.
 
+With the branch site deployed (deploy_branch = true) it also:
+
+  3. Installs the newest Applications and Threats, Antivirus and WildFire
+     content on the branch firewall and schedules recurring updates.
+  4. Configures the IPsec tunnel on all three firewalls (each node of the
+     pair gets its own copy: HA config sync is off) and verifies it, end to
+     end, with an HTTP request from the branch workload to a pair workload.
+
 Input comes from `terraform output -json configure_inputs`.
 
   python3 scripts/configure.py                 # configure, then verify
@@ -25,6 +33,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -519,6 +528,393 @@ def publish_inbound(firewalls, inbound):
     return sync_config(firewalls)
 
 
+# ---------------------------------------------------------------------------
+# Idempotent config helpers
+# ---------------------------------------------------------------------------
+
+
+def _covers(current, desired):
+    """True if the running node `current` already holds everything in `desired`.
+
+    A subset test, not equality: PAN-OS stores elements in schema order and
+    fills in defaults, so the running copy of an object rarely serialises like
+    the element that created it. <key> holds an encrypted secret in the running
+    config and cannot be compared, so it is skipped.
+    """
+    if current is None or current.tag != desired.tag:
+        return False
+    if any(k != "uuid" and current.get(k) != v for k, v in desired.attrib.items()):
+        return False
+    if len(desired) == 0:
+        return desired.tag == "key" or (desired.text or "").strip() == (current.text or "").strip()
+    return all(any(_covers(c, d) for c in current) for d in desired)
+
+
+def _ensure(fw, parent, element):
+    """Create or replace the node `element` under `parent`. Returns True if changed."""
+    desired = ET.fromstring(element)
+    name = desired.get("name")
+    xpath = "%s/%s" % (parent, desired.tag) + ("[@name='%s']" % name if name else "")
+    current = _running_subtree(fw, xpath)
+    if _covers(current, desired):
+        return False
+    if current is None:
+        fw.set(parent, element)
+    else:
+        fw._request({"type": "config", "action": "edit", "xpath": xpath,
+                     "element": element, "key": fw.key})
+    return True
+
+
+def _ensure_member(fw, xpath, member):
+    """Add <member> to the list at xpath unless it is already there."""
+    node = _running_subtree(fw, xpath)
+    if node is not None and member in [m.text for m in node.findall("member")]:
+        return False
+    fw.set(xpath, "<member>%s</member>" % member)
+    return True
+
+
+def _above_deny(fw, names):
+    """Move the named security rules above deny-all where they are not already."""
+    changed = False
+    for name in names:
+        rules = fw.get("%s/security/rules" % RULEBASE).findall(".//rules/entry")
+        order = [e.get("name") for e in rules]
+        if "deny-all" in order and name in order and order.index(name) > order.index("deny-all"):
+            fw._request({"type": "config", "action": "move", "where": "before", "dst": "deny-all",
+                         "xpath": "%s/security/rules/entry[@name='%s']" % (RULEBASE, name),
+                         "key": fw.key})
+            changed = True
+    return changed
+
+
+def _commit_if_needed(fw, changed):
+    if changed or _pending_changes(fw):
+        fw.commit()
+        ok("%s: commit complete" % fw.name)
+
+
+# ---------------------------------------------------------------------------
+# IPsec tunnel: branch <-> HA pair
+# ---------------------------------------------------------------------------
+
+TUNNEL_IF = "tunnel.1"
+IKE_PROFILE = "panw-ike-aes256"
+IPSEC_PROFILE = "panw-ipsec-aes256"
+MONITOR_PROFILE = "panw-tunnel-monitor"
+VR = DEVICE + "/network/virtual-router/entry[@name='default']"
+VSYS = DEVICE + "/vsys/entry[@name='vsys1']"
+
+# Tunnel names on each end, as (IKE gateway, IPsec tunnel).
+TUNNEL_NAMES = {"hub": ("branch-gw", "to-branch"), "branch": ("hub-gw", "to-hub")}
+
+
+def _tunnel_config(side, vpn):
+    """(parent xpath, element) pairs for one end of the tunnel, in apply order.
+
+    Route-based IKEv2. Both ends sit behind AWS 1:1 NAT, so NAT-T is on and
+    each end identifies itself by its PUBLIC address (the default IKE ID would
+    be its private one). On the pair the local address is just the untrust
+    interface: it is DHCP, its IP differs per node, and whichever node is
+    active owns the floating EIP that the branch peers with.
+    """
+    hub = side == "hub"
+    gw, tunnel = TUNNEL_NAMES[side]
+    local_pub, peer_pub = ((vpn["hub_public_ip"], vpn["branch_public_ip"]) if hub
+                           else (vpn["branch_public_ip"], vpn["hub_public_ip"]))
+    untrust_if = "ethernet1/2" if hub else "ethernet1/1"
+    remote_cidr = vpn["branch_cidr"] if hub else vpn["hub_cidr"]
+    local_cidr = vpn["hub_cidr"] if hub else vpn["branch_cidr"]
+    tunnel_ip = "%s/%s" % (vpn["hub_tunnel_ip"] if hub else vpn["branch_tunnel_ip"],
+                           vpn["tunnel_cidr"].split("/")[1])
+    # BOTH ends monitor the tunnel by pinging the other end's tunnel IP.
+    #
+    # The pair's end is what makes a failover recover. The new active node
+    # inherits the old one's IPsec SAs over HA2 -- including its PRIVATE local
+    # address, which in another AZ is not its own, so AWS drops everything it
+    # sends -- but not its IKE SA. Its own monitor then fails, and with no IKE
+    # SA to rekey inside it starts a fresh one from its own address, which
+    # replaces the branch's stale one. With only the branch monitoring, the
+    # branch kept retrying inside its stale IKE SA and the tunnel stayed down
+    # until dead-peer detection expired it: about 10 minutes, measured twice,
+    # whether the branch's monitor action was wait-recover or fail-over.
+    # (A passive node's monitor is idle: its dataplane is down.)
+    peer_tunnel_ip = vpn["branch_tunnel_ip"] if hub else vpn["hub_tunnel_ip"]
+    monitor = (
+        "<tunnel-monitor><enable>yes</enable><destination-ip>%s</destination-ip>"
+        "<tunnel-monitor-profile>%s</tunnel-monitor-profile></tunnel-monitor>"
+        % (peer_tunnel_ip, MONITOR_PROFILE))
+    both = [vpn["hub_cidr"], vpn["branch_cidr"]]
+
+    # Without a named profile the monitor falls back to one called "default",
+    # which PAN-OS 11.2 does not ship ("tunnel monitoring profile default not
+    # found" at commit). wait-recover: keep routing into the tunnel while it
+    # renegotiates, which is all a single tunnel can do anyway.
+    profile = [
+        (DEVICE + "/network/profiles/monitor-profile",
+         "<entry name='%s'><interval>3</interval><threshold>5</threshold>"
+         "<action>wait-recover</action></entry>" % MONITOR_PROFILE),
+    ]
+
+    return profile + [
+        (DEVICE + "/network/ike/crypto-profiles/ike-crypto-profiles",
+         "<entry name='%s'><hash><member>sha256</member></hash>"
+         "<dh-group><member>group14</member></dh-group>"
+         "<encryption><member>aes-256-cbc</member></encryption>"
+         "<lifetime><hours>8</hours></lifetime></entry>" % IKE_PROFILE),
+        (DEVICE + "/network/ike/crypto-profiles/ipsec-crypto-profiles",
+         "<entry name='%s'><esp><encryption><member>aes-256-cbc</member></encryption>"
+         "<authentication><member>sha256</member></authentication></esp>"
+         "<dh-group>group14</dh-group><lifetime><hours>1</hours></lifetime></entry>"
+         % IPSEC_PROFILE),
+        (DEVICE + "/network/interface/tunnel/units",
+         "<entry name='%s'><ip><entry name='%s'/></ip>"
+         "<interface-management-profile>mgmt-ping</interface-management-profile>"
+         "<comment>IPsec to the %s (configure.py)</comment></entry>"
+         % (TUNNEL_IF, tunnel_ip, "branch" if hub else "HA pair")),
+        (DEVICE + "/network/ike/gateway",
+         "<entry name='%s'>"
+         "<authentication><pre-shared-key><key>%s</key></pre-shared-key></authentication>"
+         "<protocol><ikev2><ike-crypto-profile>%s</ike-crypto-profile>"
+         "<dpd><enable>yes</enable></dpd></ikev2><version>ikev2</version></protocol>"
+         "<protocol-common><nat-traversal><enable>yes</enable></nat-traversal></protocol-common>"
+         "<local-address><interface>%s</interface></local-address>"
+         "<peer-address><ip>%s</ip></peer-address>"
+         "<local-id><type>ipaddr</type><id>%s</id></local-id>"
+         "<peer-id><type>ipaddr</type><id>%s</id></peer-id></entry>"
+         % (gw, vpn["psk"], IKE_PROFILE, untrust_if, peer_pub, local_pub, peer_pub)),
+        (DEVICE + "/network/tunnel/ipsec",
+         "<entry name='%s'><auto-key><ike-gateway><entry name='%s'/></ike-gateway>"
+         "<ipsec-crypto-profile>%s</ipsec-crypto-profile></auto-key>"
+         "<tunnel-interface>%s</tunnel-interface>%s</entry>"
+         % (tunnel, gw, IPSEC_PROFILE, TUNNEL_IF, monitor)),
+        # No next hop: a point-to-point tunnel interface needs none.
+        (VR + "/routing-table/ip/static-route",
+         "<entry name='%s'><destination>%s</destination><interface>%s</interface>"
+         "<metric>10</metric></entry>" % (tunnel, remote_cidr, TUNNEL_IF)),
+        (VSYS + "/zone",
+         "<entry name='vpn'><network><layer3><member>%s</member></layer3></network></entry>"
+         % TUNNEL_IF),
+        # Workload traffic both ways. Also matches trust -> trust, which the
+        # pair already allows (allow-east-west).
+        (RULEBASE + "/security/rules",
+         "<entry name='allow-site-to-site'>"
+         "<description>Security VPC &lt;-&gt; branch over IPsec (configure.py)</description>"
+         "<from>%s</from><to>%s</to><source>%s</source><destination>%s</destination>"
+         "<source-user><member>any</member></source-user>"
+         "<application><member>any</member></application>"
+         "<service><member>any</member></service><category><member>any</member></category>"
+         "<action>allow</action><log-end>yes</log-end></entry>"
+         % (_members(["trust", "vpn"]), _members(["trust", "vpn"]), _members(both), _members(both))),
+        # Tunnel-monitor pings are vpn -> vpn, which deny-all would otherwise catch.
+        (RULEBASE + "/security/rules",
+         "<entry name='allow-tunnel-monitor'>"
+         "<description>Tunnel monitoring between the tunnel interfaces (configure.py)</description>"
+         "<from><member>vpn</member></from><to><member>vpn</member></to>"
+         "<source><member>%s</member></source><destination><member>%s</member></destination>"
+         "<source-user><member>any</member></source-user>"
+         "<application><member>ping</member></application>"
+         "<service><member>application-default</member></service>"
+         "<category><member>any</member></category>"
+         "<action>allow</action><log-end>yes</log-end></entry>"
+         % (vpn["tunnel_cidr"], vpn["tunnel_cidr"])),
+        # IKE and ESP to and from the firewall itself are untrust -> untrust,
+        # which deny-all would otherwise catch -- in BOTH directions: the
+        # firewall's own initiating packets are policy-checked too, and in AWS
+        # they leave from its PRIVATE untrust address (the IGW maps it to the
+        # EIP), while the peer's arrive from its public one.
+        (RULEBASE + "/security/rules",
+         "<entry name='allow-ike'>"
+         "<description>IKE / IPsec with the tunnel peer (configure.py)</description>"
+         "<from><member>untrust</member></from><to><member>untrust</member></to>"
+         "<source>%s</source><destination>%s</destination>"
+         "<source-user><member>any</member></source-user>"
+         "<application>%s</application>"
+         "<service><member>application-default</member></service>"
+         "<category><member>any</member></category>"
+         "<action>allow</action><log-end>yes</log-end></entry>"
+         % (_members([peer_pub, local_cidr]), _members([peer_pub, local_cidr]),
+            _members(["ike", "ipsec-esp", "ipsec-esp-udp"]))),
+    ]
+
+
+TUNNEL_RULES = ("allow-site-to-site", "allow-tunnel-monitor", "allow-ike")
+
+
+def ensure_tunnel(fw, side, vpn):
+    """Apply one end of the tunnel to the candidate config. Returns True if changed.
+
+    The pre-shared key is compared only on creation (the running copy is
+    encrypted), so changing ipsec_psk later means deleting the IKE gateways
+    first, or editing the key on every firewall by hand.
+    """
+    changed = False
+    for parent, element in _tunnel_config(side, vpn):
+        if parent == VR + "/routing-table/ip/static-route":
+            # PAN-OS checks the route's and the zone's interface reference
+            # when they are SET, so tunnel.1 must be in the virtual router and
+            # the vsys first ("interface 'tunnel.1' is not a valid reference").
+            changed = _ensure_member(fw, VR + "/interface", TUNNEL_IF) or changed
+            changed = _ensure_member(fw, VSYS + "/import/network/interface", TUNNEL_IF) or changed
+        if _ensure(fw, parent, element):
+            node = ET.fromstring(element)
+            ok("%s: %s '%s'" % (fw.name, parent.rsplit("/", 1)[-1], node.get("name")))
+            changed = True
+    changed = _above_deny(fw, TUNNEL_RULES) or changed
+    return changed
+
+
+def configure_tunnel(pair, branch, vpn):
+    step("IPsec tunnel: %s (branch) <-> %s (HA pair floating IP)"
+         % (vpn["branch_public_ip"], vpn["hub_public_ip"]))
+    # Network config is per node (HA config sync is off), so each node of the
+    # pair is configured and committed on its own. Their tunnel policy comes
+    # out identical, so the later policy sync has nothing to copy for it.
+    good = True
+    for fw, side in [(fw, "hub") for fw in pair] + [(branch, "branch")]:
+        try:
+            changed = ensure_tunnel(fw, side, vpn)
+            if not changed:
+                ok("%s: tunnel config up to date" % fw.name)
+            _commit_if_needed(fw, changed)
+        except PanOSError as exc:
+            fail("%s: %s" % (fw.name, exc))
+            good = False
+            # A half-applied tunnel would make every later commit on this
+            # firewall fail too (the inbound rules' commit, for one).
+            try:
+                fw.op("<revert><config></config></revert>")
+                warn("%s: uncommitted changes reverted" % fw.name)
+            except PanOSError:
+                pass
+    return good
+
+
+# ---------------------------------------------------------------------------
+# Content updates (dynamic updates)
+# ---------------------------------------------------------------------------
+
+# (label, op command keyword, license feature required). Antivirus and
+# WildFire packages install only on top of Applications and Threats, so order
+# matters. "Threat Prevention" also matches "Advanced Threat Prevention", and
+# "WildFire" matches "Advanced WildFire".
+CONTENT_TYPES = (
+    ("Applications and Threats", "content", None),
+    ("Antivirus", "anti-virus", "Threat Prevention"),
+    ("WildFire", "wildfire", "WildFire"),
+)
+
+# Recurring schedule per content type: threats every 30 minutes, antivirus
+# hourly, WildFire every minute; all download-and-install.
+UPDATE_SCHEDULE = {
+    "content": "<threats><recurring><every-30-mins><at>2</at>"
+               "<action>download-and-install</action></every-30-mins></recurring></threats>",
+    "anti-virus": "<anti-virus><recurring><hourly><at>4</at>"
+                  "<action>download-and-install</action></hourly></recurring></anti-virus>",
+    "wildfire": "<wildfire><recurring><every-min>"
+                "<action>download-and-install</action></every-min></recurring></wildfire>",
+}
+
+
+def _license_features(fw):
+    root = fw.op("<request><license><info></info></license></request>")
+    return [e.findtext("feature") or "" for e in root.findall(".//licenses/entry")]
+
+
+def _version_key(version):
+    return tuple(int(p) for p in re.findall(r"\d+", version or ""))
+
+
+def _job(fw, cmd, timeout):
+    root = fw.op(cmd, timeout=180)
+    job = root.findtext(".//job")
+    if not job:
+        raise PanOSError("%s: no job id returned: %s"
+                         % (fw.name, " ".join(t.strip() for t in root.itertext() if t.strip())[:200]))
+    return fw.wait_for_job(job, timeout=timeout)
+
+
+def update_content_type(fw, label, kind, settle=600):
+    """Download and install the newest release of one content type."""
+    req = "<request><%s><upgrade>%%s</upgrade></%s></request>" % (kind, kind)
+    # Straight after first boot the license and the update-server connection
+    # are still settling, and the check fails for a few minutes.
+    deadline = time.time() + settle
+    while True:
+        try:
+            root = fw.op(req % "<check></check>", timeout=180)
+            break
+        except PanOSError as exc:
+            if time.time() >= deadline:
+                raise
+            print("  %s %s: %s check not ready (%s); retrying"
+                  % (_c("...", Colors.DIM), fw.name, label, str(exc)[-60:]), end="\r", flush=True)
+            time.sleep(30)
+    entries = [e for e in root.iter("entry") if e.findtext("version")]
+    if not entries:
+        raise PanOSError("%s: no %s releases offered" % (fw.name, label))
+    latest = max(entries, key=lambda e: _version_key(e.findtext("version")))
+    version = latest.findtext("version")
+    # Checked before the threat license is active, the firewall offers the
+    # applications-only package. Installed, it reports the same version as
+    # the full one later offered, so "current" alone would hide that the
+    # threat signatures are missing (threat-version 0).
+    apps_only = kind == "content" and "Threats" in (latest.findtext("features") or "") and \
+        fw.op("<show><system><info></info></system></show>").findtext(".//threat-version") in (None, "", "0")
+    if latest.findtext("current") == "yes" and not apps_only:
+        ok("%s: %s %s is installed (latest)" % (fw.name, label, version))
+        return
+    if latest.findtext("downloaded") != "yes":
+        info("%s: downloading %s %s" % (fw.name, label, version))
+        _job(fw, req % "<download><latest/></download>", timeout=1200)
+    info("%s: installing %s %s" % (fw.name, label, version))
+    _job(fw, req % "<install><version>latest</version></install>", timeout=1800)
+    ok("%s: %s %s installed" % (fw.name, label, version))
+
+
+def update_content(fw):
+    step("Content updates on %s" % fw.name)
+    try:
+        features = _license_features(fw)
+    except PanOSError as exc:
+        fail("%s: could not read licenses: %s" % (fw.name, exc))
+        return False
+    good = True
+    installed = []
+    for label, kind, needs in CONTENT_TYPES:
+        if needs and not any(needs in f for f in features):
+            warn("%s: no %s license; skipping %s" % (fw.name, needs, label))
+            continue
+        try:
+            update_content_type(fw, label, kind)
+            installed.append(kind)
+        except PanOSError as exc:
+            print()
+            fail("%s: %s update failed: %s" % (fw.name, label, exc))
+            good = False
+            if kind == "content":
+                break  # the others need it
+    if not installed:
+        return False
+
+    # Keep them current from here on.
+    schedule = "<update-schedule>%s</update-schedule>" % "".join(UPDATE_SCHEDULE[k] for k in installed)
+    try:
+        changed = _ensure(fw, DEVICE + "/deviceconfig/system", schedule)
+        _commit_if_needed(fw, changed)
+        ok("%s: recurring updates scheduled for %s" % (fw.name, ", ".join(installed)))
+    except PanOSError as exc:
+        fail("%s: could not schedule updates: %s" % (fw.name, exc))
+        # Do not leave a change behind that every later commit would trip over.
+        try:
+            fw.op("<revert><config></config></revert>")
+        except PanOSError:
+            pass
+        good = False
+    return good
+
+
 def probe_web(floating_ip, timeout=3):
     """Return the IP the published web server reports, or None."""
     try:
@@ -668,6 +1064,104 @@ def verify_routes(inputs, states):
             else:
                 info(label)
     return good
+
+
+def _ipsec_sa_up(fw, tunnel):
+    root = fw.op("<show><vpn><ipsec-sa><tunnel>%s</tunnel></ipsec-sa></vpn></show>" % tunnel)
+    return any(tunnel in "".join(e.itertext()) for e in root.iter("entry"))
+
+
+def _ssm_run(region, instance_id, command, timeout=90):
+    """Run a shell command on an instance through SSM; its stdout, or None if it never ran."""
+    try:
+        cid = subprocess.check_output(
+            ["aws", "ssm", "send-command", "--region", region, "--instance-ids", instance_id,
+             "--document-name", "AWS-RunShellScript",
+             "--parameters", json.dumps({"commands": [command]}),
+             "--query", "Command.CommandId", "--output", "text"],
+            stderr=subprocess.PIPE,
+        ).decode().strip()
+    except subprocess.CalledProcessError as exc:
+        warn("ssm send-command to %s failed: %s" % (instance_id, exc.stderr.decode().strip()[:160]))
+        return None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            out = json.loads(subprocess.check_output(
+                ["aws", "ssm", "get-command-invocation", "--region", region,
+                 "--command-id", cid, "--instance-id", instance_id, "--output", "json"],
+                stderr=subprocess.PIPE,
+            ))
+        except subprocess.CalledProcessError:
+            continue  # InvocationDoesNotExist for the first moments
+        if out["Status"] in ("Pending", "InProgress", "Delayed"):
+            continue
+        return (out.get("StandardOutputContent") or "").strip()
+    warn("SSM command on %s did not finish within %ds" % (instance_id, timeout))
+    return None
+
+
+def verify_tunnel(pair, branch, inputs, timeout=120):
+    step("IPsec tunnel")
+    hub_tunnel = TUNNEL_NAMES["hub"][1]
+    gw, tunnel = TUNNEL_NAMES["branch"]
+    up = _ipsec_sa_up(branch, tunnel)
+    if not up:
+        # Tunnel monitoring brings it up on its own; this just saves the wait.
+        info("%s: no IPsec SA yet; initiating" % branch.name)
+        for cmd in ("<test><vpn><ike-sa><gateway>%s</gateway></ike-sa></vpn></test>" % gw,
+                    "<test><vpn><ipsec-sa><tunnel>%s</tunnel></ipsec-sa></vpn></test>" % tunnel):
+            try:
+                branch.op(cmd)
+            except PanOSError as exc:
+                warn("%s: %s" % (branch.name, exc))
+        deadline = time.time() + timeout
+        while not up and time.time() < deadline:
+            time.sleep(5)
+            up = _ipsec_sa_up(branch, tunnel)
+    if not up:
+        fail("%s: no IPsec SA for %s after %ds. Check Network > IPSec Tunnels and the "
+             "system log (subtype ike) on both ends." % (branch.name, tunnel, timeout))
+        return False
+    ok("%s: IPsec SA for %s is up" % (branch.name, tunnel))
+
+    active = next((fw for fw in pair if fw.ha_state().get("local_state") == "active"), None)
+    if active:
+        hub_up = _ipsec_sa_up(active, hub_tunnel)
+        (ok if hub_up else warn)("%s (active): IPsec SA for %s %s"
+                                 % (active.name, hub_tunnel, "is up" if hub_up else "not found"))
+
+    # End to end: the branch workload fetches a pair workload's test page.
+    src = inputs["branch"].get("workload_instance_id")
+    targets = inputs.get("workload_ips") or []
+    if not src or not targets:
+        info("No test workloads; skipping the end-to-end check.")
+        return True
+    # Retried: straight after an HA failover the SAs read "up" but are the
+    # ones copied from the old active node, and traffic only flows once the
+    # new node's tunnel monitor has failed and renegotiated (~35 s measured).
+    started = time.time()
+    deadline = started + timeout
+    while True:
+        got = _ssm_run(inputs["region"], src, "curl -s -m 5 http://%s/ip" % targets[0])
+        if got is None:
+            # Usually the branch workload's SSM agent has not registered yet.
+            warn("Could not run the end-to-end check through SSM; re-run --verify-only shortly.")
+            return True
+        if got == targets[0] or time.time() >= deadline:
+            break
+        print("  %s waiting for traffic over the tunnel... %ds"
+              % (_c("...", Colors.DIM), time.time() - started), end="\r", flush=True)
+        time.sleep(5)
+    if got == targets[0]:
+        ok("Branch workload -> http://%s/ over the tunnel answered from %s%s"
+           % (targets[0], got, "" if time.time() - started < 15
+              else " (after ~%ds)" % (time.time() - started)))
+        return True
+    fail("Branch workload -> http://%s/ over the tunnel: %s"
+         % (targets[0], "got %r" % got if got else "no answer"))
+    return False
 
 
 def verify_aws_permissions(inputs):
@@ -823,12 +1317,21 @@ def main():
         hops = verify_next_hops(firewalls, inputs)
         sys.exit(0 if synced and hops else 1)
 
+    # Branch firewall, when deploy_branch = true.
+    branch_meta = inputs.get("branch")
+    vpn = inputs.get("vpn")
+    branch = PanOS(branch_meta["mgmt_public_ip"], name=branch_meta["name"]) if branch_meta else None
+    if branch:
+        wait_for_api(branch, username, password, timeout=args.boot_timeout)
+        print(" " * 100, end="\r")
+        ok("%s @ %s authenticated" % (branch.name, branch.host))
+
     step("Licensing")
-    for fw in firewalls:
+    for fw in firewalls + ([branch] if branch else []):
         if not check_license(fw):
             fetch_license(fw)
 
-    published = True
+    published = content_ok = tunnel_ok = True
     if not args.verify_only:
         step("VM-Series AWS plugin failover mode")
         # The command syncs to the peer, so it is issued once.
@@ -836,6 +1339,13 @@ def main():
             set_failover_mode(firewalls[0])
         except PanOSError as exc:
             fail("could not set failover mode: %s" % exc)
+
+        # Every firewall, each on its own: content and schedules are not
+        # synced between the nodes of the pair (HA config sync is off).
+        for fw in firewalls + ([branch] if branch else []):
+            content_ok = update_content(fw) and content_ok
+        if branch:
+            tunnel_ok = configure_tunnel(firewalls, branch, vpn)
 
         # A failure here should not skip the health checks below.
         try:
@@ -849,6 +1359,12 @@ def main():
     ha_ok = verify_next_hops(firewalls, inputs) and ha_ok
     verify_routes(inputs, states)
     verify_web(inputs)
+    if branch:
+        try:
+            tunnel_ok = verify_tunnel(firewalls, branch, inputs) and tunnel_ok
+        except PanOSError as exc:
+            fail("tunnel verification: %s" % exc)
+            tunnel_ok = False
 
     if args.failover_test:
         if not ha_ok:
@@ -862,6 +1378,13 @@ def main():
                     states[fw.name] = fw.ha_state()
                 except PanOSError:
                     pass
+            if branch:
+                # The tunnel follows the floating EIP to the new active node.
+                try:
+                    tunnel_ok = verify_tunnel(firewalls, branch, inputs, timeout=180) and tunnel_ok
+                except PanOSError as exc:
+                    fail("tunnel verification after failover: %s" % exc)
+                    tunnel_ok = False
 
     step("Summary")
     for name, meta in sorted(inputs["firewalls"].items()):
@@ -869,9 +1392,15 @@ def main():
         info("%-16s %-9s https://%s  (AZ %s)"
              % (name, st.get("local_state", "unknown"),
                 meta["mgmt_public_ip"], meta["availability_zone"]))
+    if branch:
+        info("%-16s %-9s https://%s  (AZ %s)"
+             % (branch.name, "branch", branch.host, branch_meta["availability_zone"]))
     info("floating service IP : %s" % inputs["floating_eip"]["public_ip"])
     info("failover route tables: %s" % ", ".join(inputs["route_table_ids"]))
-    return 0 if ha_ok and published else 1
+    if vpn:
+        info("IPsec tunnel        : %s (branch) <-> %s, %s <-> %s"
+             % (vpn["branch_public_ip"], vpn["hub_public_ip"], vpn["branch_cidr"], vpn["hub_cidr"]))
+    return 0 if ha_ok and published and content_ok and tunnel_ok else 1
 
 
 if __name__ == "__main__":

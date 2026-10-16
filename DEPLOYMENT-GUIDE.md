@@ -1,10 +1,11 @@
-# Deployment Guide: Palo Alto VM-Series HA Pair in AWS
+# Deployment Guide: VM-Series HA Pair plus an IPsec-Connected Branch Site in AWS
 
 > [!WARNING]
 > **Not for production use.** This project is a demonstration. It was built
-> to show that an active/passive firewall pair spread across two Amazon Web
-> Services (AWS) Availability Zones can fail over while keeping a floating
-> public IP address that does not change after failover.
+> to show two things: an active/passive firewall pair spread across two
+> Amazon Web Services (AWS) Availability Zones can fail over while keeping a
+> floating public IP address, and a branch site's IPsec tunnel to that address
+> follows the failover.
 >
 > **Use it at your own risk.** It is not officially supported by Palo Alto
 > Networks, AWS, or any other entity. No warranty is given, and nobody is
@@ -12,21 +13,38 @@
 > of using it.
 
 **Who this is for:** anyone with an AWS account and a Mac terminal. You do not
-need to have used Terraform, Palo Alto firewalls, or high availability (HA)
-before. Every command is copy-paste, and after each one this guide tells you
-what you should see.
+need to have used Terraform, Palo Alto firewalls, high availability (HA) or
+IPsec before. Every command is copy-paste, and after each one this guide
+tells you what you should see.
 
-**What you will end up with:** two Palo Alto firewalls in AWS (`us-east-2`),
-one **active** and one **passive**, in different Availability Zones (separate
-data centres). Behind them sit two test servers, and a test web page is
-published on a public IP address. You will then deliberately take down the
-active firewall and watch the passive one take over, with the web page coming
-back in about 10 to 30 seconds.
+**What you will end up with:** three Palo Alto firewalls in AWS
+(`us-east-2`), in two separate networks, joined by an encrypted tunnel:
+
+1. **The main site: a high-availability pair.** Two firewalls in different
+   Availability Zones (separate data centres), one **active** and one
+   **passive**. Behind them sit two test servers, and a test web page is
+   published on a public IP address.
+2. **The branch site: a third firewall** in its own network, with one test
+   server behind it.
+3. **An IPsec tunnel** between the branch firewall and the main site, so the
+   test servers at each site can reach each other privately.
+
+All three run PAN-OS 11.2.15, license themselves, and install the latest
+threat protection updates.
+
+You will then deliberately take down the active firewall at the main site
+and watch the passive one take over. The web page comes back in about 10 to
+30 seconds, and the tunnel from the branch reconnects to the new active
+firewall in under a minute, without any change at the branch.
 
 **Time required:** about an hour, most of it waiting.
-**Cost while running:** roughly **$1.60 per hour (about $38 per day)**.
+**Cost while running:** roughly **$2.40 per hour (about $58 per day)**.
 [Part 11](#part-11--delete-everything) deletes everything; do it when you
 are finished.
+
+> Only want the HA pair? Set `deploy_branch = false` in `terraform.tfvars`
+> before deploying. The branch steps in this guide then do not apply, and the
+> cost drops to about $1.60 per hour.
 
 ---
 
@@ -36,11 +54,11 @@ are finished.
 |---|---|---|
 | [Part 1](#part-1--install-the-tools) | Install the tools | 10 min |
 | [Part 2](#part-2--connect-the-aws-cli-to-your-account) | Connect the AWS CLI to your account | 5 min |
-| [Part 3](#part-3--preview-the-build-changes-nothing) | Preview the build (changes nothing) | 5 min |
-| [Part 4](#part-4--deploy) | Deploy | 30 min |
+| [Part 3](#part-3--preview-the-build-and-add-your-license-codes) | Preview the build and add your license codes | 10 min |
+| [Part 4](#part-4--deploy) | Deploy all three firewalls | 35 min |
 | [Part 5](#part-5--log-in-to-the-firewalls) | Log in to the firewalls | 5 min |
-| [Part 6](#part-6--confirm-the-pair-is-healthy) | Confirm the pair is healthy (**do not skip**) | 5 min |
-| [Part 7](#part-7--prove-traffic-flows-through-the-firewall) | Prove traffic flows through the firewall | 5 min |
+| [Part 6](#part-6--confirm-everything-is-healthy) | Confirm everything is healthy (**do not skip**) | 5 min |
+| [Part 7](#part-7--prove-traffic-flows-through-the-firewalls-and-the-tunnel) | Prove traffic flows through the firewalls and the tunnel | 10 min |
 | [Part 8](#part-8--the-failover-test) | **The failover test** | 15 min |
 | [Part 9](#part-9--making-configuration-changes) | Making configuration changes | as needed |
 | [Part 10](#part-10--troubleshooting) | Troubleshooting | as needed |
@@ -48,9 +66,27 @@ are finished.
 
 ---
 
-## A two-minute explanation of what you're building
+## A three-minute explanation of what you're building
 
-Two firewalls. Only one does any work at a time.
+```
+                                       Internet
+               ┌──────────────────────────┴──────────────────────────┐
+       branch tunnel IP                                         floating IP
+               │                                      (always on the ACTIVE firewall)
+               │◄═══════════════ encrypted IPsec tunnel ════════════►│
+               │                                                     │
+ ┌─────────────┴─────────────┐   ┌───────────────────────────────────┴───────────────┐
+ │ BRANCH SITE               │   │ MAIN SITE                                         │
+ │ network 10.200.0.0/16     │   │ network 10.100.0.0/16                             │
+ │                           │   │   us-east-2a                      us-east-2b      │
+ │  Branch firewall          │   │   FW-A  ACTIVE  ◄── heartbeat ──► FW-B  PASSIVE   │
+ │             │             │   │        │                                          │
+ │             │             │   │        │  route tables point at the active FW     │
+ │  test server + web page   │   │   test servers + web page, one per AZ             │
+ └───────────────────────────┘   └───────────────────────────────────────────────────┘
+```
+
+### The main site: two firewalls, only one working at a time
 
 - **FW-A** is in Availability Zone `us-east-2a` and starts as **active**.
 - **FW-B** is in `us-east-2b` and starts as **passive**: powered on,
@@ -64,34 +100,32 @@ Two things point at the active firewall:
    internet, go to FW-A."
 2. **The floating IP.** One public IP address (an AWS *Elastic IP*, or EIP)
    is attached to the active firewall. The test web page is published on
-   it, and the test servers' outbound traffic leaves from it.
+   it, the test servers' outbound traffic leaves from it, and the branch's
+   tunnel connects to it.
 
 When the active firewall fails, the passive one promotes itself, and a piece
 of firewall software called the **VM-Series AWS plugin** calls the AWS API to
 **turn both signposts around**: the route tables now point at FW-B, and the
 floating IP moves to FW-B. You will watch that happen in Part 8.
 
-```
-                              Internet
-                                 │
-                       floating IP (public)
-                                 │
-   us-east-2a                    │                  us-east-2b
-   ┌──────────────┐              │              ┌──────────────┐
-   │    FW-A      │◄─────────────┘              │     FW-B     │
-   │   ACTIVE     │◄── heartbeat + state sync ─►│   PASSIVE    │
-   └──────┬───────┘                             └──────────────┘
-          │ ▲
-          │ └── route tables point here ... until failover, then at FW-B
-   ┌──────┴───────┐                             ┌──────────────┐
-   │ test server  │                             │ test server  │
-   │ + web page   │                             │ + web page   │
-   └──────────────┘                             └──────────────┘
-```
+### The branch site: one firewall on its own
 
-The web page shows the private IP address of the server that answered. The
-same server answers before and after a failover; only the firewall in the
-path changes.
+A separate network with a single firewall and a test server. It is not part
+of the HA pair and does not fail over. It stands in for a remote office that
+needs to reach servers at the main site.
+
+### The tunnel: what joins the two
+
+The branch firewall builds an encrypted **IPsec tunnel** across the internet
+to the main site's **floating IP**. Traffic between the two networks
+(`10.200.x.x` and `10.100.x.x`) goes through it. Because the branch connects
+to the floating IP and not to FW-A itself, a failover at the main site just
+means the tunnel reconnects, to FW-B now, at the same address. Both ends
+check the tunnel every few seconds, so the new active firewall notices it
+needs a fresh connection and makes one on its own, in about 35 seconds.
+
+Every test server runs a small web page showing its own private IP address,
+so you can always tell which server answered and over which path.
 
 ---
 
@@ -161,7 +195,7 @@ Expect `Python 3.9` or newer. If it's missing: `brew install python3`.
 
 ## 1.6 — Session Manager plugin
 
-This lets you reach things **inside** the AWS network (a shell on a test
+This lets you reach things **inside** the AWS networks (a shell on a test
 server, or a firewall's web page) without opening any firewall rules. It is
 also your way back in if you ever get locked out of the firewalls'
 management pages, so install it.
@@ -251,8 +285,8 @@ aws service-quotas get-service-quota --region us-east-2 \
   --query 'Quota.Value' --output text
 ```
 
-**You need at least `36.0`** (two 16-vCPU firewalls plus two small test
-servers). If it's lower (new accounts often show `5.0`), request an increase
+**You need at least `54.0`**: three 16-vCPU firewalls plus three small test
+servers. If it's lower (new accounts often show `5.0`), request an increase
 now so it can be approved while you continue:
 
 ```bash
@@ -266,7 +300,7 @@ aws service-quotas request-service-quota-increase \
 
 ---
 
-# Part 3 — Preview the build (changes nothing)
+# Part 3 — Preview the build and add your license codes
 
 Go to the project folder:
 
@@ -275,8 +309,8 @@ cd ~/Downloads/panw-ha-aws
 ls
 ```
 
-You should see `deploy.sh`, `destroy.sh`, `main.tf`, `templates`, `scripts`,
-`README.md` and others.
+You should see `deploy.sh`, `destroy.sh`, `main.tf`, `branch.tf`,
+`templates`, `scripts`, `README.md` and others.
 
 Run a **dry run**. It creates nothing, costs nothing, and can be repeated:
 
@@ -292,26 +326,62 @@ Run a **dry run**. It creates nothing, costs nothing, and can be repeated:
 | Checking AWS access | Your credentials work | your account number and ARN |
 | Marketplace subscription | Your account may launch the Palo Alto image | `Marketplace subscription active for byol` |
 | EC2 vCPU quota | Your account may run enough compute | `vCPU quota is sufficient` |
-| Preparing terraform.tfvars | First run only: writes your settings file with your current public IP | `mgmt_allowed_cidrs = ["x.x.x.x/32"]` |
+| Preparing terraform.tfvars | First run only: writes your settings file with your current public IP | `wrote terraform.tfvars` |
 | terraform init / validate | Downloads providers, checks the code | `Success! The configuration is valid.` |
 | terraform plan | Lists what would be created | `Plan: NN to add, 0 to change, 0 to destroy.` |
 
-It then stops. Nothing has been built. The exact number to add varies by
-version (roughly 100); what matters is **`0 to destroy`** and no red
-`Error:`.
+On the very first run it stops at **Preparing terraform.tfvars** with
+`panos_auth_codes is not set`. That is expected: add your license codes
+(3.1) and run it again.
 
-## 3.1 — Who can reach the firewalls' management pages
+When it gets all the way through, nothing has been built. The exact number
+to add varies by version (about 150 with the branch site); what matters is
+**`0 to destroy`** and no red `Error:`.
 
-Your settings live in `terraform.tfvars` (created by the step above; open it
-with `open -e terraform.tfvars`). Two settings decide who can reach the
-firewalls' web pages and command line:
+## 3.1 — License codes
+
+Each firewall licenses itself with Palo Alto the first time it starts, using
+an **auth code** from the Palo Alto Customer Support Portal. Open your
+settings file:
+
+```bash
+open -e terraform.tfvars
+```
+
+Choose one of these:
+
+- **One code for all three firewalls.** Put it on the `panos_auth_codes`
+  line. The code must have **three** seats (FW-A, FW-B and the branch).
+  ```hcl
+  panos_auth_codes = "YOUR-AUTH-CODE"
+  ```
+- **A separate code for the branch.** The main code then needs only two
+  seats.
+  ```hcl
+  panos_auth_codes  = "YOUR-AUTH-CODE"
+  branch_auth_codes = "YOUR-BRANCH-AUTH-CODE"
+  ```
+
+`deploy.sh` prints a `NOTE` when the branch is reusing `panos_auth_codes`, as
+a reminder about the seat count. `terraform.tfvars` is never committed to
+git, so the codes stay private.
+
+> **Threat updates need subscriptions.** Each firewall installs the latest
+> Applications and Threats package, plus Antivirus and WildFire if its
+> license includes those subscriptions. Without them it installs what it
+> can and tells you what it skipped.
+
+## 3.2 — Who can reach the firewalls' management pages
+
+Two settings in `terraform.tfvars` decide who can reach the web pages and
+command line of all three firewalls:
 
 | Setting | Default | Allows |
 |---|---|---|
 | `mgmt_allowed_cidrs` | the public IP `deploy.sh` detected | HTTPS (web page) and SSH |
 | `admin_workstation_cidrs` | `["0.0.0.0/1", "128.0.0.0/1"]` | **everything, from anywhere** ("Admin Workstation" rule) |
 
-Both go into the AWS security group **and** the firewall's own allowlist.
+Both go into the AWS security groups **and** the firewalls' own allowlists.
 
 **Why the default is so wide:** on corporate networks that route through a
 cloud proxy such as Prisma Access, your public IP can differ per website, so
@@ -337,14 +407,17 @@ admin_workstation_cidrs = ["203.0.113.45/32"]
 > [Part 10](#problem-cant-reach-the-firewall-web-pages) has the way back in,
 > which needs no rules at all.
 
+Run `./deploy.sh --plan-only` once more and confirm it reaches the plan.
+
 ---
 
 # Part 4 — Deploy
 
 ### Before you start
 
-- Allow about **30 minutes**: about 5 for Terraform, 10 to 20 for the
-  firewalls to boot, then a few minutes of configuration.
+- Allow about **35 minutes**: about 5 for Terraform, 10 to 20 for the
+  firewalls to boot, then several minutes of configuration and threat
+  updates.
 - **Don't let your Mac sleep or close Terminal** during it.
 - If it dies partway, that's recoverable: see
   [Part 10](#problem-terraform-apply-failed-partway-through).
@@ -358,7 +431,10 @@ admin_workstation_cidrs = ["203.0.113.45/32"]
 It repeats the Part 3 checks, shows the plan and stops:
 
 ```
-Build this? Type 'yes' to continue:
+About to create a VM-Series HA pair in us-east-2 of account 123456789012.
+Plus a branch VPC with a third firewall (m5.4xlarge) and an IPsec tunnel.
+Three firewalls plus EIPs; this costs real money per hour.
+Type 'yes' to continue:
 ```
 
 Type `yes` and press Enter.
@@ -369,16 +445,20 @@ A long stream of lines like:
 
 ```
 aws_vpc.this: Creating...
-aws_vpc.this: Creation complete after 2s [id=vpc-0abc123...]
+aws_vpc.branch[0]: Creating...
 aws_instance.fw["a"]: Still creating... [30s elapsed]
+aws_instance.branch_fw[0]: Still creating... [30s elapsed]
 ```
 
-`Still creating...` is normal. Stage 1 ends with
+`aws_vpc.this` and `aws_instance.fw[...]` are the main site;
+anything named `branch` is the branch site. `Still creating...` is normal.
+Stage 1 ends with
 `Apply complete! Resources: NN added, 0 changed, 0 destroyed.`
 
 ### Stage 2 — The firewalls boot (10 to 20 minutes)
 
-`deploy.sh` now runs `scripts/configure.py`, which waits for the firewalls:
+`deploy.sh` now runs `scripts/configure.py`, which waits for each firewall in
+turn:
 
 ```
 ==> Connecting to the firewall pair
@@ -388,23 +468,49 @@ aws_instance.fw["a"]: Still creating... [30s elapsed]
 **This sits there for a long time, and that is correct.** On first boot a
 VM-Series firewall starts PAN-OS, downloads its configuration from S3,
 applies it, redeems its license with Palo Alto, and reboots. The status
-moves from `unreachable` to `API not ready` to logged in. The script gives up
-after 40 minutes.
+moves from `unreachable` to `API not ready` to logged in. All three boot at
+the same time, so by the time FW-A answers the others are usually ready too.
+The script gives up after 40 minutes per firewall.
 
-### Stage 3 — Configuration and verification (a few minutes)
+### Stage 3 — Configuration and verification (several minutes)
 
-Once both firewalls answer, you see (addresses will differ):
+Once the firewalls answer, `configure.py` works through them. Addresses and
+version numbers will differ:
 
 ```
   [ ok ] panw-ha-fw-a @ 3.14.x.x authenticated
   [ ok ] panw-ha-fw-b @ 18.22.x.x authenticated
+  [ ok ] panw-ha-branch-fw @ 3.18.x.x authenticated
 
 ==> Licensing
   panw-ha-fw-a: license PA-VM                              expires ...
   ...
+  panw-ha-branch-fw: license Advanced Threat Prevention    expires ...
 
 ==> VM-Series AWS plugin failover mode
   [ ok ] panw-ha-fw-a: HA failover mode set to secondary-ip
+
+==> Content updates on panw-ha-fw-a
+  panw-ha-fw-a: downloading Applications and Threats 9160-10295
+  panw-ha-fw-a: installing Applications and Threats 9160-10295
+  [ ok ] panw-ha-fw-a: Applications and Threats 9160-10295 installed
+  ...                                             (then Antivirus and WildFire)
+  [ ok ] panw-ha-fw-a: commit complete
+  [ ok ] panw-ha-fw-a: recurring updates scheduled for content, anti-virus, wildfire
+
+==> Content updates on panw-ha-fw-b
+  ...                                             (the same)
+==> Content updates on panw-ha-branch-fw
+  ...                                             (the same)
+
+==> IPsec tunnel: 3.19.x.x (branch) <-> 52.x.x.x (HA pair floating IP)
+  [ ok ] panw-ha-fw-a: gateway 'branch-gw'
+  ...
+  [ ok ] panw-ha-fw-a: commit complete
+  ...                                             (the same on panw-ha-fw-b)
+  [ ok ] panw-ha-branch-fw: gateway 'hub-gw'
+  ...
+  [ ok ] panw-ha-branch-fw: commit complete
 
 ==> Inbound publishing (floating IP -> 10.100.20.x)
   [ ok ] panw-ha-fw-a: nat rule 'inbound-dnat-1' -> 10.100.20.x
@@ -439,18 +545,30 @@ Once both firewalls answer, you see (addresses will differ):
 ==> Published web server
   [ ok ] http://52.x.x.x/ answered from 10.100.20.x
 
+==> IPsec tunnel
+  panw-ha-branch-fw: no IPsec SA yet; initiating
+  [ ok ] panw-ha-branch-fw: IPsec SA for to-hub is up
+  [ ok ] panw-ha-fw-a (active): IPsec SA for to-branch is up
+  [ ok ] Branch workload -> http://10.100.20.x/ over the tunnel answered from 10.100.20.x
+
 ==> Summary
   panw-ha-fw-a     active    https://3.14.x.x   (AZ us-east-2a)
   panw-ha-fw-b     passive   https://18.22.x.x  (AZ us-east-2b)
+  panw-ha-branch-fw branch    https://3.18.x.x   (AZ us-east-2a)
   floating service IP : 52.x.x.x
+  IPsec tunnel        : 3.19.x.x (branch) <-> 52.x.x.x, 10.200.0.0/16 <-> 10.100.0.0/16
 ```
 
 **That's success:** every line `[ ok ]`, one firewall `active` and one
-`passive`.
+`passive`, and the tunnel's last line answered from a main-site test server.
 
 > **`running-sync=not synchronized` is expected.** The firewalls' built-in
 > config sync is deliberately off in this design (Part 9 explains why). It
 > is not an error.
+
+> **`[warn] Could not run the end-to-end check through SSM`?** The branch
+> test server had not finished registering with AWS yet. Wait a couple of
+> minutes and run `python3 scripts/configure.py --verify-only`.
 
 ---
 
@@ -459,14 +577,15 @@ Once both firewalls answer, you see (addresses will differ):
 ## 5.1 — Addresses, username and password
 
 ```bash
-terraform output firewall_management_urls
+terraform output firewall_management_urls          # FW-A and FW-B
+terraform output branch_firewall_management_url    # branch firewall
 terraform output admin_username
 cat .secrets/admin_password
 ```
 
-The username is **`pandmin`** (not `admin`). The password exists only in
-that file; keep it. To copy it to the clipboard without showing it:
-`pbcopy < .secrets/admin_password`.
+The username is **`pandmin`** (not `admin`) on all three firewalls, with the
+same password. The password exists only in that file; keep it. To copy it
+to the clipboard without showing it: `pbcopy < .secrets/admin_password`.
 
 ## 5.2 — Open the web interface
 
@@ -486,10 +605,10 @@ Device.
 > warning)? See
 > [Part 10](#problem-cant-reach-the-firewall-web-pages).
 
-## 5.3 — The High Availability widget
+## 5.3 — Main site: the High Availability widget
 
-On the Dashboard, find the **High Availability** widget (if it's missing:
-**Widgets** dropdown → **System** → **High Availability**). On FW-A it shows:
+On FW-A's Dashboard, find the **High Availability** widget (if it's missing:
+**Widgets** dropdown → **System** → **High Availability**). It shows:
 
 - **Local:** `Active`, **Peer:** `Passive`
 - **HA1** and **HA2:** `Up`
@@ -498,7 +617,18 @@ On the Dashboard, find the **High Availability** widget (if it's missing:
 Log in to **FW-B** in another tab. Its widget is the mirror image:
 **Local: Passive**, **Peer: Active**.
 
-## 5.4 — Command line access (optional)
+## 5.4 — Branch site: tunnel and threat updates
+
+Log in to the branch firewall in a third tab. It has no HA widget; it is a
+standalone firewall. Two pages are worth a look:
+
+- **Network → IPSec Tunnels:** `to-hub`, with green status icons. On FW-A
+  the same page shows `to-branch`.
+- **Device → Dynamic Updates:** the Applications and Threats, Antivirus and
+  WildFire versions marked **Currently Installed**, and a **Schedule** on
+  each.
+
+## 5.5 — Command line access (optional)
 
 Two accounts exist on each firewall:
 
@@ -511,6 +641,9 @@ Two accounts exist on each firewall:
 ssh -i .secrets/panw-ha-key.pem admin@<firewall management IP>
 ```
 
+Useful on the branch: `show vpn ipsec-sa` lists the tunnel's security
+associations.
+
 If SSH times out or hangs (many corporate networks block outbound SSH), use
 the SSM tunnel in
 [Part 10](#problem-cant-reach-the-firewall-web-pages) and connect to
@@ -518,7 +651,7 @@ the SSM tunnel in
 
 ---
 
-# Part 6 — Confirm the pair is healthy
+# Part 6 — Confirm everything is healthy
 
 Failing over an unhealthy pair just takes your traffic down. Spend five
 minutes here.
@@ -527,22 +660,23 @@ minutes here.
 python3 scripts/configure.py --verify-only
 ```
 
-This is **read-only**; run it as often as you like. Check:
+This changes no configuration; run it as often as you like. Check:
 
 | # | Check | Section of the output | Required |
 |---|---|---|---|
 | 1 | One active, one passive | HA state | Exactly one of each, never two active |
-| 2 | Firewalls licensed | Licensing | Entries with future expiry dates |
-| 3 | Each firewall uses its own gateways | Firewall next hops | All `[ ok ]` (FW-A `10.100.2.1`/`10.100.3.1`, FW-B `10.100.12.1`/`10.100.13.1`) |
+| 2 | All three firewalls licensed | Licensing | Entries with future expiry dates for each |
+| 3 | Each firewall of the pair uses its own gateways | Firewall next hops | All `[ ok ]` (FW-A `10.100.2.1`/`10.100.3.1`, FW-B `10.100.12.1`/`10.100.13.1`) |
 | 4 | Routes point at the active firewall | VPC route tables | All `[ ok ]` |
 | 5 | The web page answers | Published web server | `answered from 10.100.20.x` |
+| 6 | The tunnel is up and carries traffic | IPsec tunnel | `IPsec SA for to-hub is up`, and `answered from 10.100.20.x` |
 
-**All five must pass before Part 8.** If one doesn't, find it in
+**All six must pass before Part 8.** If one doesn't, find it in
 [Part 10](#part-10--troubleshooting).
 
 ---
 
-# Part 7 — Prove traffic flows through the firewall
+# Part 7 — Prove traffic flows through the firewalls and the tunnel
 
 ## 7.1 — Inbound: open the web page
 
@@ -557,10 +691,10 @@ active firewall → test server, and back.
 
 For scripts, `http://<floating IP>/ip` returns just the IP.
 
-## 7.2 — Outbound: ask a test server for its public IP
+## 7.2 — Outbound: ask a main-site test server for its public IP
 
 The test servers have no public IP of their own, so the only way they can
-reach the internet is through the firewall. This uses the AWS API to run a
+reach the internet is through a firewall. This uses the AWS API to run a
 command on one, with no extra software:
 
 ```bash
@@ -585,11 +719,42 @@ IP. After a failover it is still the floating IP, now on the other firewall.
 Prefer an interactive shell on the server? `aws ssm start-session --target "$ID"`
 (type `exit` to leave).
 
-## 7.3 — See it on the firewall
+## 7.3 — Across the tunnel: main site to branch
 
-In FW-A's web interface: **Monitor → Traffic**. You'll see your web request
-(rule `allow-inbound`) and the server's outbound traffic (rule
-`allow-outbound`). Logs can take 30 seconds to appear.
+Now ask the same main-site test server to fetch the **branch** test server's
+web page. The branch server has only a private address (`10.200.x.x`), which
+the internet cannot reach, so the only way the request can get there is
+through the tunnel:
+
+```bash
+ID=$(terraform output -json workload_instance_ids | python3 -c 'import json,sys;print(json.load(sys.stdin)[0])')
+BRANCH_IP=$(terraform output -raw branch_workload_private_ip)
+CMD=$(aws ssm send-command --region us-east-2 --instance-ids "$ID" \
+  --document-name AWS-RunShellScript \
+  --parameters "commands=[\"curl -s --max-time 10 http://$BRANCH_IP/ip\"]" \
+  --query 'Command.CommandId' --output text)
+sleep 8
+aws ssm get-command-invocation --region us-east-2 --command-id "$CMD" --instance-id "$ID" \
+  --query '[Status,StandardOutputContent]' --output text
+```
+
+**Success:** `Success    10.200.10.x`, the branch server's own address. The
+request went main-site server → active firewall → tunnel → branch firewall
+→ branch server, and back.
+
+`configure.py` tests the other direction (branch to main site) every time it
+runs: that is the `Branch workload -> … answered from …` line.
+
+## 7.4 — See it on the firewalls
+
+- **FW-A → Monitor → Traffic.** Your web request (rule `allow-inbound`), the
+  server's outbound traffic (rule `allow-outbound`), and the request to the
+  branch (rule `allow-site-to-site`, zone `trust` to zone `vpn`).
+- **Branch firewall → Monitor → Traffic.** The same request arriving from
+  the tunnel (rule `allow-site-to-site`, zone `vpn` to zone `trust`), and
+  the tunnel-monitor pings (rule `allow-tunnel-monitor`).
+
+Logs can take 30 seconds to appear.
 
 ---
 
@@ -599,7 +764,9 @@ In FW-A's web interface: **Monitor → Traffic**. You'll see your web request
 
 That when the active firewall stops, the passive one becomes active, moves
 the route tables and the floating IP to itself through the AWS API, and
-traffic resumes, with nobody touching anything.
+traffic resumes, with nobody touching anything. Then that the branch's
+tunnel reconnects to the new active firewall, again with nobody touching
+anything.
 
 ### What success looks like
 
@@ -607,11 +774,17 @@ traffic resumes, with nobody touching anything.
 2. The route tables' next hop moves to it (**about 10 seconds** measured).
 3. The web page answers again, from the **same** server (**about 12 seconds**
    measured).
+4. The tunnel is up again, now ending on the new active firewall, and
+   carries traffic between the sites (**about 35 seconds** measured).
 
-10 to 30 seconds of interruption is the expected result for this design.
+10 to 30 seconds of interruption is the expected result for the main site.
 **Connections that were open during the failover are reset** (each firewall
 translates traffic to its own addresses), so clients reconnect; new
-connections work as soon as the routes move.
+connections work as soon as the routes move. The tunnel takes a little
+longer. The new active firewall inherits its peer's tunnel keys, which are
+tied to the peer's address and can't carry traffic from the new one. Its
+tunnel check fails after about 15 seconds, and it then builds a fresh
+tunnel.
 
 ### What happens afterwards
 
@@ -623,7 +796,7 @@ back raced the AWS updates. To fail back, run the test again.
 
 Yes. Suspending a firewall is a reversible software state; nothing is
 deleted or stopped. The script always restores the suspended firewall, even
-if it is interrupted.
+if it is interrupted. The branch firewall is never touched.
 
 ---
 
@@ -658,20 +831,32 @@ It re-checks health first and refuses to run if the pair isn't healthy.
   [ ok ] panw-ha-fw-a returned to functional
   panw-ha-fw-a is now the standby. Run --failover-test again to fail back.
 
+==> IPsec tunnel
+  [ ok ] panw-ha-branch-fw: IPsec SA for to-hub is up
+  [ ok ] panw-ha-fw-b (active): IPsec SA for to-branch is up
+  [ ok ] Branch workload -> http://10.100.20.125/ over the tunnel answered from 10.100.20.125 (after ~30s)
+
 ==> Summary
   panw-ha-fw-a     initial   https://3.14.x.x   (AZ us-east-2a)
   panw-ha-fw-b     active    https://18.22.x.x  (AZ us-east-2b)
+  panw-ha-branch-fw branch    https://3.18.x.x   (AZ us-east-2a)
 ```
 
-The two lines that matter:
+The lines that matter:
 
 - `Routes moved off … -> now …`: AWS routing now points at the other
   firewall.
 - `After: … -> 10.100.20.125, ~12s after the suspend`: the web page came back
   through the other firewall, from the same server.
+- `panw-ha-fw-b (active): IPsec SA for to-branch is up` and the
+  `Branch workload …` line: the tunnel now ends on FW-B and carries traffic.
 
 `initial` in the summary is the restored firewall rejoining; a few seconds
-later it reads `passive`.
+later it reads `passive`. The SA lines read `up` straight away, because the
+new active firewall holds the copied keys. Only the `Branch workload` line
+proves traffic flows, and it shows how long the new tunnel took. While it
+waits you'll see `waiting for traffic over the tunnel...`. The script waits
+up to three minutes.
 
 Meanwhile the watcher window shows:
 
@@ -688,7 +873,7 @@ not from the suspend.)
 ### Fail back
 
 Run the same command again. It suspends FW-B, moves everything back to FW-A,
-and leaves FW-B as standby:
+leaves FW-B as standby, and checks the tunnel again:
 
 ```bash
 python3 scripts/configure.py --failover-test
@@ -709,14 +894,17 @@ See [Part 10](#problem-ha-fails-over-but-the-routes-never-move).
 ## Test 2 — By hand, watching it happen
 
 1. Start `./scripts/watch-failover.sh` in a second window, and open
-   `http://<floating IP>/` in a browser.
+   `http://<floating IP>/` in a browser. Open the branch firewall's
+   **Network → IPSec Tunnels** page in another tab.
 2. On the **active** firewall's web UI: **Device → High Availability →
    Operational Commands → Suspend local device** → **OK**.
 3. Watch the watcher: within about 10 to 30 seconds it prints
    `*** ROUTES MOVED ***` pointing at the other firewall. Refresh the web
    page: same server IP.
 4. On the other firewall, the Dashboard HA widget now reads **Local: Active**
-   (refresh if stale).
+   (refresh if stale). Its **Network → IPSec Tunnels** page shows
+   `to-branch` going green; refresh the branch's page to see `to-hub` green
+   again.
 5. Bring the suspended firewall back: on it, **Device → High Availability →
    Operational Commands → Make local device functional** → **OK**. It
    returns as **passive**; the routes stay where they are.
@@ -751,7 +939,7 @@ It needs several minutes to boot and rejoin as passive. Re-run
 
 # Part 9 — Making configuration changes
 
-### Policy changes (rules, NAT, objects, zones, profiles)
+### Policy changes at the main site (rules, NAT, objects, zones, profiles)
 
 1. Make the change on the **active** firewall, in the web UI or CLI, and
    **Commit** it.
@@ -782,12 +970,18 @@ all traffic the moment it became active. So built-in sync is off, and
 `--sync-config` copies only policy (never network, HA, management or admin
 settings).
 
-### Network changes (interfaces, virtual router)
+### Network changes at the main site (interfaces, virtual router, IPsec)
 
-These are per-firewall. Make them on **each** firewall separately, keep each
-firewall's next hops on its own subnets, then run
+These are per-firewall. Make them on **each** firewall of the pair
+separately, keep each firewall's next hops on its own subnets, then run
 `python3 scripts/configure.py --verify-only` and check **Firewall next
-hops**.
+hops**. This includes the tunnel's settings: `configure.py` set them on both
+firewalls, and any change must be made on both too.
+
+### Changes at the branch
+
+The branch firewall is standalone. Change it directly and commit; nothing
+is copied to or from it.
 
 ### Publishing something else
 
@@ -825,12 +1019,13 @@ still restores the suspended firewall.
 ## Problem: `VcpuLimitExceeded` / `QUOTA TOO LOW`
 
 Your account's compute limit is too low; it's not a fault in the deployment.
-This build needs 36 vCPUs:
+This build needs 54 vCPUs:
 
 | What | Count | vCPUs each | Total |
 |---|---|---|---|
-| Firewalls (`m5.4xlarge`) | 2 | 16 | 32 |
-| Test servers (`t3.micro`) | 2 | 2 | 4 |
+| Main-site firewalls (`m5.4xlarge`) | 2 | 16 | 32 |
+| Branch firewall (`m5.4xlarge`) | 1 | 16 | 16 |
+| Test servers (`t3.micro`) | 3 | 2 | 6 |
 
 Request an increase (it costs nothing to have headroom):
 
@@ -849,16 +1044,24 @@ aws service-quotas list-requested-service-quota-change-history-by-quota \
 ```
 
 Then re-run `./deploy.sh`; Terraform reuses what it already built.
+`deploy_branch = false` brings the requirement down to 36.
 
 > **Smaller firewalls?** Only with a matching license. The instance must be at
 > least as large as the VM-Series model the auth code licenses; if it is
-> smaller, PAN-OS refuses the license and never finishes starting.
+> smaller, PAN-OS refuses the license and never finishes starting. The
+> branch's size is `branch_instance_type` (empty = same as the pair).
 
 ## Problem: `Marketplace subscription required`
 
 The account isn't subscribed to the Palo Alto listing. `deploy.sh` prints the
 URL: open it, **Continue to Subscribe**, accept the terms, wait about five
 minutes, re-run.
+
+## Problem: `panos_auth_codes is not set`
+
+`deploy.sh` will not build BYOL firewalls without a license code, because they
+would boot but never pass traffic. Add it as described in
+[3.1](#31--license-codes).
 
 ## Problem: `reading S3 Object (...): couldn't find resource`
 
@@ -879,7 +1082,7 @@ If it times out again, check the instances are healthy:
 
 ```bash
 IDS=$(aws ec2 describe-instances --region us-east-2 \
-  --filters "Name=tag:Project,Values=panw-ha" "Name=tag:HaGroup,Values=*" \
+  --filters "Name=tag:Project,Values=panw-ha" "Name=tag:Name,Values=panw-ha-fw-a,panw-ha-fw-b,panw-ha-branch-fw" \
   --query 'Reservations[].Instances[].InstanceId' --output text)
 aws ec2 describe-instance-status --region us-east-2 --include-all-instances --instance-ids $IDS \
   --query 'InstanceStatuses[].[InstanceId,InstanceState.Name,InstanceStatus.Status]' --output text
@@ -894,17 +1097,17 @@ The page times out (no certificate warning, nothing). Two common causes:
 
 1. **Your public IP isn't allowed.** Your IP changed, or you're behind a
    proxy that uses a different IP per destination.
-2. **Automatic remediation in your AWS account replaced the management
+2. **Automatic remediation in your AWS account replaced a management
    security group** with a restricted copy. Check what's attached:
    ```bash
    aws ec2 describe-network-interfaces --region us-east-2 \
      --filters "Name=tag:Role,Values=mgmt" \
      --query 'NetworkInterfaces[].[TagSet[?Key==`Name`]|[0].Value, join(`, `, Groups[].GroupName)]' --output text
    ```
-   Terraform's own group is `panw-ha-sg-mgmt`. Names like
-   `panw-ha-sg-mgmt-ar-NNN` or `…_xpanse_ar_NNN` are copies made by
-   remediation; Terraform deliberately leaves them alone. Each copy's
-   description says which rule was removed:
+   Terraform's own groups are `panw-ha-sg-mgmt` (main site) and
+   `panw-ha-branch-sg-mgmt` (branch). Names ending `-ar-NNN` or
+   `…_xpanse_ar_NNN` are copies made by remediation; Terraform deliberately
+   leaves them alone. Each copy's description says which rule was removed:
    ```bash
    aws ec2 describe-security-groups --region us-east-2 \
      --filters "Name=group-name,Values=*-ar-*" \
@@ -912,8 +1115,8 @@ The page times out (no certificate warning, nothing). Two common causes:
    ```
 
 **The way in that always works: an SSM tunnel.** It goes through a test
-server inside the VPC over HTTPS to AWS, so it needs no inbound rules and
-passes most corporate proxies:
+server in the same network over HTTPS to AWS, so it needs no inbound rules
+from you and passes most corporate proxies. For the main site:
 
 ```bash
 W=$(terraform output -json workload_instance_ids | python3 -c 'import json,sys;print(json.load(sys.stdin)[0])')
@@ -923,25 +1126,38 @@ aws ssm start-session --region us-east-2 --target "$W" \
 ```
 
 Leave it running and browse to **https://localhost:8443** for FW-A. For
-FW-B use `host=10.100.10.10` and `localPortNumber=8444`. For SSH, use
+FW-B use `host=10.100.10.10` and `localPortNumber=8444`. For the branch
+firewall, go through the branch test server instead:
+
+```bash
+W=$(terraform output -raw branch_workload_instance_id)
+aws ssm start-session --region us-east-2 --target "$W" \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters 'host=10.200.0.10,portNumber=443,localPortNumber=8445'
+```
+
+and browse to **https://localhost:8445**. For SSH, use
 `portNumber=22,localPortNumber=2222` and then
 `ssh -i .secrets/panw-ha-key.pem -p 2222 admin@localhost`.
 
 `configure.py` talks to the firewalls' public management IPs, so to run it
 again you need direct access back. Either add your current IP to an
-attached security group, or attach Terraform's `panw-ha-sg-mgmt` group
-**alongside** the existing ones:
+attached security group, or attach Terraform's own group **alongside** the
+existing ones. For the main site:
 
 ```bash
 TF=$(terraform state show aws_security_group.mgmt | awk '$1=="id"{gsub(/"/,"",$3);print $3;exit}')
-for eni in $(aws ec2 describe-network-interfaces --region us-east-2 --filters "Name=tag:Role,Values=mgmt" --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+for eni in $(aws ec2 describe-network-interfaces --region us-east-2 --filters "Name=tag:Role,Values=mgmt" "Name=tag:Firewall,Values=panw-ha-fw-a,panw-ha-fw-b" --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
   CUR=$(aws ec2 describe-network-interfaces --region us-east-2 --network-interface-ids $eni --query 'NetworkInterfaces[0].Groups[].GroupId' --output text)
   aws ec2 modify-network-interface-attribute --region us-east-2 --network-interface-id $eni --groups $CUR $TF
 done
 ```
 
-Check with your security team first if remediation removed it. If
-`panw-ha-sg-mgmt` still contains a `0.0.0.0/0` rule on SSH or HTTPS (from
+For the branch, use `aws_security_group.branch_mgmt[0]` and
+`Values=panw-ha-branch-fw` in the same commands.
+
+Check with your security team first if remediation removed it. If a
+Terraform group still contains a `0.0.0.0/0` rule on SSH or HTTPS (from
 `mgmt_allowed_cidrs = ["0.0.0.0/0"]`), remediation will swap it out again;
 set `mgmt_allowed_cidrs` to specific addresses and `terraform apply` first.
 
@@ -961,7 +1177,8 @@ The login page loads, but `pandmin` and the password from
    `show system info`.
 2. **The firewall isn't licensed.** Without a license PAN-OS never finishes
    starting its authentication service, so no password works. Read the boot
-   log from AWS, which needs no login:
+   log from AWS, which needs no login (use `panw-ha-branch-fw` for the
+   branch):
    ```bash
    ID=$(aws ec2 describe-instances --region us-east-2 \
      --filters "Name=tag:Name,Values=panw-ha-fw-a" "Name=instance-state-name,Values=running" \
@@ -970,40 +1187,45 @@ The login page loads, but `pandmin` and the password from
    ```
    `… is not supported for this platform` means the auth code is for the
    wrong product (you need a VM-Series capacity code). A size mismatch means
-   the instance is smaller than the licensed model. Put the right code in
-   `terraform.tfvars` as `panos_auth_codes = "YOURCODE"` and rebuild the
-   firewalls (below).
+   the instance is smaller than the licensed model. If only the **branch**
+   fails while the pair is fine, the shared code has probably run out of
+   seats: set `branch_auth_codes`. Fix the code in `terraform.tfvars` and
+   rebuild the firewall (below).
 3. **The password hash format.** PAN-OS accepts `$5$` (SHA-256) hashes; this
    project generates those. A `$6$` hash loads without error but rejects
    every login. Only relevant if you've changed `scripts/phash_helper.py`.
 
 Licensing and the admin password are applied only at a firewall's **first**
-boot. To rebuild just the firewalls (keeping the VPC, IPs and test servers):
+boot. To rebuild just the firewalls (keeping the networks, IPs and test
+servers):
 
 ```bash
-terraform apply -replace='aws_instance.fw["a"]' -replace='aws_instance.fw["b"]'
+terraform apply -replace='aws_instance.fw["a"]' -replace='aws_instance.fw["b"]'   # main site
+terraform apply -replace='aws_instance.branch_fw[0]'                               # branch
 python3 scripts/configure.py
 ```
 
-That takes about 20 minutes. Rebuilt firewalls don't release their old
-licenses: deactivate the old serial numbers in the Palo Alto support portal,
-or the auth code may run out of seats.
+That takes about 20 minutes. `configure.py` puts the tunnel and the threat
+updates back. Rebuilt firewalls don't release their old licenses: deactivate
+the old serial numbers in the Palo Alto support portal, or the auth code may
+run out of seats.
 
 ## Problem: a commit fails with "Validation Error … unexpected here" or "no UUID found for rule"
 
 The firewall loaded a configuration at boot that it then refuses to commit,
 so **every** later commit fails. Known causes, all fixed in the current
-template: `passive-link-state` under active-passive, `action` under
+templates: `passive-link-state` under active-passive, `action` under
 `ha2-keep-alive`, and rules without a `uuid`. If you've edited
-`templates/bootstrap.xml.tftpl`, run the firewall's own check on the
-**Commit** menu (**Validate Commit**) to see the offending lines.
+`templates/bootstrap.xml.tftpl` or `templates/branch-bootstrap.xml.tftpl`,
+run the firewall's own check on the **Commit** menu (**Validate Commit**) to
+see the offending lines.
 
 ## Problem: the GUI asks to change packet IO mode to mmap and reboot
 
 You switched the AWS failover mode to **interface-move**. Don't reboot.
 Go to **Device → VM-Series**, click **Change to secondary-ip mode**, and
-check both firewalls show **secondary-ip**. `configure.py` also sets it on
-every run.
+check both firewalls of the pair show **secondary-ip**. `configure.py` also
+sets it on every run.
 
 ## Problem: both firewalls say "Active" (split brain)
 
@@ -1075,9 +1297,45 @@ gateway (FW-A `10.100.2.1` / `10.100.3.1`, FW-B `10.100.12.1` /
 
 1. `--verify-only`: active firewall, correct next hops, routes pointing at
    it?
-2. **Monitor → Traffic** on the active firewall, filtered on the server's IP.
-3. Right after a failover, give the SSM agent a couple of minutes to
-   reconnect before concluding anything is broken.
+2. **Monitor → Traffic** on the firewall in front of it (the active firewall
+   at the main site, or the branch firewall), filtered on the server's IP.
+3. Right after a deployment or a failover, give the SSM agent a couple of
+   minutes to reconnect before concluding anything is broken.
+
+## Problem: the IPsec tunnel does not come up
+
+1. `python3 scripts/configure.py --verify-only` starts negotiation and
+   reports the result.
+2. On the branch firewall, go to **Monitor → System** and filter with
+   `( subtype eq vpn )`. A message about the IKE ID or the pre-shared key
+   means the two ends disagree. Re-run `python3 scripts/configure.py` to
+   reapply both ends.
+3. Check that the main site has an active firewall and that the floating IP
+   is on it (`--verify-only`). The branch connects only to the floating IP.
+4. On both ends, **Monitor → Traffic** filtered on `( port.dst eq 500 )`.
+   Hits on `deny-all` (app `not-applicable`) mean `allow-ike` is missing,
+   below `deny-all`, or from an older version that allowed only the peer's
+   address: a firewall's own IKE packets leave from its private untrust IP,
+   so the rule must list that too. Re-run `python3 scripts/configure.py`.
+
+## Problem: the tunnel is up but test servers can't reach each other
+
+1. **Monitor → Traffic** on both ends, filtered on the other site's network
+   (`( addr in 10.200.0.0/16 )` at the main site, `( addr in 10.100.0.0/16 )`
+   at the branch). Hits on `deny-all` mean `allow-site-to-site` is missing.
+2. Each end needs a static route to the other site's network via `tunnel.1`
+   (**Network → Virtual Routers → default → Static Routes**, `to-branch` or
+   `to-hub`). Re-run `python3 scripts/configure.py` to restore it.
+
+## Problem: threat updates fail
+
+1. **License error:** the firewall has no license, or lacks the
+   subscription for that update type. If it reuses `panos_auth_codes`, the
+   code must cover three firewalls; set `branch_auth_codes` to give it its
+   own code.
+2. **`check not ready` for several minutes, then a failure:** the firewall
+   could not reach Palo Alto's update servers yet. Re-run
+   `python3 scripts/configure.py`; it skips anything already installed.
 
 ## Problem: `terraform apply` failed partway through
 
@@ -1117,28 +1375,31 @@ in the web UI.
 
 # Part 11 — Delete everything
 
-**Do this when you're finished;** the stack costs about $38 per day.
+**Do this when you're finished;** the whole build costs about $58 per day.
 
 ```bash
 cd ~/Downloads/panw-ha-aws
 ./destroy.sh
 ```
 
-It lists what will be deleted and asks you to type `destroy` (not `yes`).
-It takes about 10 minutes and ends with `Destroy complete!`.
+It lists what will be deleted (both sites) and asks you to type `destroy`
+(not `yes`). It takes about 10 minutes and ends with `Destroy complete!`.
 
-### If it fails with `DependencyViolation` on a security group or the VPC
+### If it fails with `DependencyViolation` on a security group or a VPC
 
-Something outside Terraform added resources to the VPC. The usual culprit
+Something outside Terraform added resources to a VPC. The usual culprit
 is security groups created by automatic remediation (names containing
 `-ar-`). Terraform's own groups are exactly `panw-ha-sg-mgmt`, `-ha2`,
-`-untrust`, `-trust` and `-workload`; this lists everything else:
+`-untrust`, `-trust` and `-workload` at the main site, and
+`panw-ha-branch-sg-mgmt`, `-untrust`, `-trust` and `-workload` at the branch.
+This lists everything else in both VPCs:
 
 ```bash
-VPC=$(terraform output -raw vpc_id 2>/dev/null)
-aws ec2 describe-security-groups --region us-east-2 --filters "Name=vpc-id,Values=$VPC" \
-  --query 'SecurityGroups[?GroupName!=`default`].[GroupId,GroupName]' --output text \
-  | grep -vE '\spanw-ha-sg-(mgmt|ha2|untrust|trust|workload)$'
+for VPC in $(aws ec2 describe-vpcs --region us-east-2 --filters "Name=tag:Project,Values=panw-ha" --query 'Vpcs[].VpcId' --output text); do
+  aws ec2 describe-security-groups --region us-east-2 --filters "Name=vpc-id,Values=$VPC" \
+    --query 'SecurityGroups[?GroupName!=`default`].[GroupId,GroupName]' --output text \
+    | grep -vE '\spanw-ha-(branch-)?sg-(mgmt|ha2|untrust|trust|workload)$'
+done
 ```
 
 Once the instances are gone, delete each one listed
@@ -1162,13 +1423,13 @@ unattached.
 ### Licenses
 
 Destroying the firewalls doesn't release their BYOL licenses. Deactivate
-the serial numbers in the Palo Alto support portal so the auth code can be
-used again.
+all three serial numbers in the Palo Alto support portal so the auth codes
+can be used again.
 
 ### What stays on your Mac
 
-`.secrets/` (password and SSH key). Delete it when you're sure you're done:
-`rm -rf .secrets`
+`.secrets/` (password, SSH key and IPsec pre-shared key). Delete it when
+you're sure you're done: `rm -rf .secrets`
 
 ---
 
@@ -1176,51 +1437,62 @@ used again.
 
 ```bash
 cd ~/Downloads/panw-ha-aws
-aws sso login                                  # if credentials expired
+aws sso login                                    # if credentials expired
 
-./deploy.sh --plan-only                        # preview, change nothing
-./deploy.sh                                    # deploy (asks first)
+./deploy.sh --plan-only                          # preview, change nothing
+./deploy.sh                                      # deploy everything (asks first)
 
-python3 scripts/configure.py                   # configure + verify (safe to re-run)
-python3 scripts/configure.py --verify-only     # health check, read-only
-python3 scripts/configure.py --failover-test   # fail over (run again to fail back)
-python3 scripts/configure.py --sync-config     # copy policy active -> passive
-./scripts/watch-failover.sh                    # live route watcher (2nd window)
+python3 scripts/configure.py                     # configure + verify (safe to re-run)
+python3 scripts/configure.py --verify-only       # health check, pair + tunnel
+python3 scripts/configure.py --failover-test     # fail over (run again to fail back)
+python3 scripts/configure.py --sync-config       # copy policy active -> passive
+./scripts/watch-failover.sh                      # live route watcher (2nd window)
 
-terraform output floating_service_ip           # http://<this>/ = test web page
-terraform output firewall_management_urls      # firewall web UIs
-terraform output workload_instance_ids         # test servers (for SSM)
-cat .secrets/admin_password                    # pandmin password
+terraform output floating_service_ip             # http://<this>/ = test web page
+terraform output firewall_management_urls        # main-site firewall web UIs
+terraform output branch_firewall_management_url  # branch firewall web UI
+terraform output workload_instance_ids           # main-site test servers (for SSM)
+terraform output branch_workload_private_ip      # branch test server (reach it over the tunnel)
+cat .secrets/admin_password                      # pandmin password (all three firewalls)
+cat .secrets/ipsec_psk                           # IPsec pre-shared key
 
-./destroy.sh                                   # delete everything
+./destroy.sh                                     # delete everything
 ```
 
 **In the PAN-OS web interface:**
 
 | Task | Where |
 |---|---|
-| HA status | Dashboard → High Availability widget |
+| HA status (main site) | Dashboard → High Availability widget |
 | Suspend / restore a firewall | Device → High Availability → Operational Commands |
 | AWS failover mode (must be secondary-ip) | Device → VM-Series → AWS HA |
+| IPsec tunnel status | Network → IPSec Tunnels |
+| Threat update versions and schedule | Device → Dynamic Updates |
 | Licenses | Device → Licenses |
 | Static routes / next hops | Network → Virtual Routers → default → Static Routes |
 | Traffic logs | Monitor → Traffic |
-| System logs | Monitor → System |
+| System logs (including IKE) | Monitor → System |
 
 ---
 
-# A successful failover test, in short
+# A successful run, in short
 
 All of these are true:
 
 1. ✅ `--verify-only` is all `[ ok ]`: one active, one passive, own next hops,
-   routes on the active firewall, web page answering.
+   routes on the active firewall, web page answering, tunnel up.
 2. ✅ `http://<floating IP>/` shows a test server's IP.
-3. ✅ `--failover-test` reports `Routes moved …` within about 10 to 30
+3. ✅ A main-site test server can fetch the branch test server's page across
+   the tunnel (7.3), and every firewall's **Device → Dynamic Updates** shows
+   current threat content.
+4. ✅ `--failover-test` reports `Routes moved …` within about 10 to 30
    seconds.
-4. ✅ It reports `After: … -> <same IP>`: the web page came back through the
+5. ✅ It reports `After: … -> <same IP>`: the web page came back through the
    other firewall.
-5. ✅ Running it again fails back the other way.
+6. ✅ After the failover, the tunnel is up on the new active firewall and
+   carries traffic between the sites.
+7. ✅ Running it again fails back the other way.
 
-Points 3 and 4 are what distinguish a working HA pair in AWS from two
-firewalls that merely agree about who is in charge.
+Points 4 to 6 are what distinguish a working HA pair in AWS from two
+firewalls that merely agree about who is in charge: the public address, the
+routes and the branch tunnel all follow the active firewall.

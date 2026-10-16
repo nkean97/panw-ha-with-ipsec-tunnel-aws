@@ -42,8 +42,8 @@ panos_auth_codes = "YOUR-AUTH-CODE"
 # ---------------------------------------------------------------------------
 # Keep panos_config_version aligned with the major.minor you pin here, or
 # PAN-OS will reject bootstrap.xml on load.
-panos_version_filter = "PA-VM-AWS-11.1*"
-panos_config_version = "11.1.0"
+panos_version_filter = "PA-VM-AWS-11.2.15-*"
+panos_config_version = "11.2.0"
 # Must be at least as large as the VM-Series model the auth code licenses, or
 # PAN-OS refuses the license and never finishes booting.
 instance_type        = "m5.4xlarge"
@@ -90,6 +90,18 @@ inbound_service     = "service-http" # PAN-OS service object (TCP 80)
 # ---------------------------------------------------------------------------
 deploy_test_workloads  = true
 workload_instance_type = "t3.micro"
+
+# ---------------------------------------------------------------------------
+# Branch site: a third firewall in its own VPC, IPsec to the HA pair's
+# floating IP. configure.py installs its content updates and the tunnel.
+# ---------------------------------------------------------------------------
+deploy_branch   = true
+branch_vpc_cidr = "10.200.0.0/16" # must not overlap vpc_cidr
+# branch_instance_type = ""       # empty = instance_type
+# Its own auth code. Leave unset to reuse panos_auth_codes, which then has to
+# cover three instances.
+# branch_auth_codes = "YOUR-BRANCH-AUTH-CODE"
+# ipsec_psk = ""                  # empty = generated into ./.secrets/ipsec_psk
 
 tags = {
   Owner       = "network-security"

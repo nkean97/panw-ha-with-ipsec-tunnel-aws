@@ -129,5 +129,54 @@ output "configure_inputs" {
         availability_zone    = fw.az
       }
     }
+    workload_ips = var.deploy_test_workloads ? aws_instance.workload[*].private_ip : []
+    # Branch firewall and the IPsec tunnel to it; null when deploy_branch = false.
+    branch = var.deploy_branch ? {
+      name                 = local.branch_name
+      mgmt_public_ip       = aws_eip.branch["mgmt"].public_ip
+      instance_id          = aws_instance.branch_fw[0].id
+      availability_zone    = local.branch_az
+      workload_instance_id = local.branch_workload_enabled == 1 ? aws_instance.branch_workload[0].id : ""
+      workload_ip          = local.branch_workload_enabled == 1 ? aws_instance.branch_workload[0].private_ip : ""
+    } : null
+    vpn = var.deploy_branch ? {
+      psk              = local.effective_ipsec_psk
+      hub_public_ip    = aws_eip.floating.public_ip
+      branch_public_ip = aws_eip.branch["untrust"].public_ip
+      hub_cidr         = var.vpc_cidr
+      branch_cidr      = var.branch_vpc_cidr
+      tunnel_cidr      = var.tunnel_cidr
+      hub_tunnel_ip    = local.hub_tunnel_ip
+      branch_tunnel_ip = local.branch_tunnel_ip
+    } : null
   }
+}
+
+###############################################################################
+# Branch site
+###############################################################################
+
+output "branch_firewall_management_url" {
+  description = "Branch firewall web UI / XML API."
+  value       = var.deploy_branch ? "https://${aws_eip.branch["mgmt"].public_ip}" : null
+}
+
+output "branch_tunnel_public_ip" {
+  description = "Branch firewall's IPsec endpoint (its untrust EIP). The pair's end is floating_service_ip."
+  value       = var.deploy_branch ? aws_eip.branch["untrust"].public_ip : null
+}
+
+output "branch_workload_instance_id" {
+  description = "Branch test workload (aws ssm start-session --target <id>)."
+  value       = local.branch_workload_enabled == 1 ? aws_instance.branch_workload[0].id : null
+}
+
+output "branch_workload_private_ip" {
+  description = "Branch test workload private IP. From a pair workload: curl http://<this>/ip"
+  value       = local.branch_workload_enabled == 1 ? aws_instance.branch_workload[0].private_ip : null
+}
+
+output "ipsec_psk_file" {
+  description = "Local file containing the IKE pre-shared key (mode 0600)."
+  value       = var.deploy_branch ? local_sensitive_file.ipsec_psk[0].filename : null
 }

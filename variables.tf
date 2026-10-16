@@ -138,9 +138,9 @@ variable "panos_auth_codes" {
 }
 
 variable "panos_version_filter" {
-  description = "AMI name filter. 'PA-VM-AWS-11.1*' pins a major.minor; 'PA-VM-AWS-*' takes the newest."
+  description = "AMI name filter. 'PA-VM-AWS-11.2.15-*' pins a release (and its hotfixes); 'PA-VM-AWS-11.2*' a major.minor; 'PA-VM-AWS-*' the newest."
   type        = string
-  default     = "PA-VM-AWS-11.1*"
+  default     = "PA-VM-AWS-11.2.15-*"
 }
 
 variable "panos_config_version" {
@@ -150,7 +150,7 @@ variable "panos_config_version" {
     on load. Keep in sync with panos_version_filter.
   EOT
   type        = string
-  default     = "11.1.0"
+  default     = "11.2.0"
 }
 
 variable "ami_id" {
@@ -259,4 +259,75 @@ variable "workload_instance_type" {
   description = "Instance type for the test workloads."
   type        = string
   default     = "t3.micro"
+}
+
+###############################################################################
+# Branch site: a third VM-Series in its own VPC, IPsec to the HA pair
+###############################################################################
+
+variable "deploy_branch" {
+  description = <<-EOT
+    Build a branch VPC with a standalone VM-Series and an IPsec tunnel from it
+    to the HA pair's floating EIP. scripts/configure.py configures the tunnel
+    and installs the latest content updates on the branch firewall.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "branch_vpc_cidr" {
+  description = "CIDR for the branch VPC. Must not overlap vpc_cidr: it is routed over the tunnel."
+  type        = string
+  default     = "10.200.0.0/16"
+
+  validation {
+    condition     = can(cidrnetmask(var.branch_vpc_cidr))
+    error_message = "branch_vpc_cidr must be a valid IPv4 CIDR."
+  }
+}
+
+variable "branch_availability_zone" {
+  description = "AZ for the branch firewall and its subnets. Empty = availability_zones[0]."
+  type        = string
+  default     = ""
+}
+
+variable "branch_instance_type" {
+  description = <<-EOT
+    EC2 type for the branch firewall. Empty = instance_type. Must be at least
+    as large as the VM-Series model its auth code licenses (see instance_type).
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "branch_auth_codes" {
+  description = <<-EOT
+    BYOL auth code for the branch firewall. Empty = reuse panos_auth_codes,
+    which then has to cover three instances. Set in terraform.tfvars only.
+  EOT
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "ipsec_psk" {
+  description = <<-EOT
+    IKE pre-shared key for the branch tunnel. Leave empty to generate one into
+    ./.secrets/ipsec_psk. Letters and digits only: it is sent inside XML.
+  EOT
+  type        = string
+  default     = ""
+  sensitive   = true
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9]*$", var.ipsec_psk))
+    error_message = "ipsec_psk may contain only letters and digits."
+  }
+}
+
+variable "tunnel_cidr" {
+  description = "/30 for the tunnel interfaces: .1 on the HA pair, .2 on the branch (tunnel monitoring pings .1)."
+  type        = string
+  default     = "169.254.100.0/30"
 }

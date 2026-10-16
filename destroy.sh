@@ -23,7 +23,7 @@ terraform plan -destroy -input=false -var-file=terraform.tfvars -no-color \
 
 if [[ $AUTO -eq 0 ]]; then
   echo
-  yellow "This permanently deletes the firewalls, the VPC, the bootstrap bucket,"
+  yellow "This permanently deletes the firewalls, the VPCs, the bootstrap bucket,"
   yellow "and releases the Elastic IPs (including the floating service IP)."
   read -r -p "Type 'destroy' to confirm: " REPLY
   [[ "$REPLY" == "destroy" ]] || { echo "Aborted."; exit 1; }

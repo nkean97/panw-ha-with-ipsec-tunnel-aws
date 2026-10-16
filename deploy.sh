@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Deploy a Palo Alto Networks VM-Series Active/Passive HA pair into a new AWS
-# VPC in us-east-2, then configure and verify it.
+# VPC in us-east-2, plus (deploy_branch = true) a branch VPC with a third
+# firewall and an IPsec tunnel to the pair, then configure and verify it all.
 #
 #   ./deploy.sh              plan, confirm, apply, configure, verify
 #   ./deploy.sh --plan-only  show the plan and stop
@@ -22,7 +23,7 @@ for arg in "$@"; do
     --plan-only) PLAN_ONLY=1 ;;
     --yes|-y)    AUTO_APPROVE=1 ;;
     --verify)    VERIFY_ONLY=1 ;;
-    -h|--help)   sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)   sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -106,7 +107,7 @@ PY
 )
 AMI_FILTER=$(python3 - <<'PY2'
 import re
-val = "PA-VM-AWS-11.1*"
+val = "PA-VM-AWS-11.2.15-*"
 try:
     m = re.search(r'panos_version_filter\s*=\s*"([^"]+)"', open("terraform.tfvars").read())
     if m:
@@ -205,6 +206,28 @@ except FileNotFoundError:
 print(val)
 PY4
 )
+WANT_BRANCH=$(python3 - <<'PY5'
+import re
+val = "true"
+try:
+    m = re.search(r'^\s*deploy_branch\s*=\s*(true|false)', open("terraform.tfvars").read(), re.M)
+    if m: val = m.group(1)
+except FileNotFoundError:
+    pass
+print(val)
+PY5
+)
+BRANCH_TYPE=$(python3 - <<PY6
+import re
+val = "$INSTANCE_TYPE"
+try:
+    m = re.search(r'^\s*branch_instance_type\s*=\s*"([^"]+)"', open("terraform.tfvars").read(), re.M)
+    if m: val = m.group(1)
+except FileNotFoundError:
+    pass
+print(val)
+PY6
+)
 
 vcpus_of() {
   aws ec2 describe-instance-types --region "$REGION" --instance-types "$1" \
@@ -217,28 +240,41 @@ if [[ -z "$FW_VCPU" || "$FW_VCPU" == "None" ]]; then
   yellow "  Could not read vCPU counts; skipping the quota check."
 else
   NEED=$(( FW_VCPU * 2 ))
-  [[ "$WANT_WORKLOADS" == "true" && -n "$WL_VCPU" && "$WL_VCPU" != "None" ]] \
-    && NEED=$(( NEED + WL_VCPU * 2 ))
+  WORKLOADS=2
+  NEED_DESC="2 x $INSTANCE_TYPE"
+  if [[ "$WANT_BRANCH" == "true" ]]; then
+    BR_VCPU=$(vcpus_of "$BRANCH_TYPE")
+    [[ -n "$BR_VCPU" && "$BR_VCPU" != "None" ]] && NEED=$(( NEED + BR_VCPU ))
+    WORKLOADS=3
+    NEED_DESC="$NEED_DESC + branch $BRANCH_TYPE"
+  fi
+  if [[ "$WANT_WORKLOADS" == "true" && -n "$WL_VCPU" && "$WL_VCPU" != "None" ]]; then
+    NEED=$(( NEED + WL_VCPU * WORKLOADS ))
+    NEED_DESC="$NEED_DESC + $WORKLOADS x $WORKLOAD_TYPE"
+  fi
 
   QUOTA=$(aws service-quotas get-service-quota --region "$REGION" \
     --service-code ec2 --quota-code L-1216C47A \
     --query 'Quota.Value' --output text 2>/dev/null || echo "")
 
-  # Standard-family vCPUs already running/pending in this region.
+  # Standard-family vCPUs already running/pending in this region, NOT
+  # counting this stack's own instances (tag Project = name_prefix): on a
+  # re-run after a partial apply they are already part of NEED.
+  NAME_PREFIX=$(sed -nE 's/^[[:space:]]*name_prefix[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$TFVARS" 2>/dev/null | tail -1)
+  NAME_PREFIX=${NAME_PREFIX:-panw-ha}
   IN_USE=$(aws ec2 describe-instances --region "$REGION" \
     --filters "Name=instance-state-name,Values=running,pending" \
-    --query 'Reservations[].Instances[].[InstanceType,CpuOptions.CoreCount,CpuOptions.ThreadsPerCore]' \
-    --output text 2>/dev/null | awk '$1 ~ /^[acdhimrtz]/ {s += ($2=="None"?0:$2) * ($3=="None"?1:$3)} END {print s+0}')
+    --query 'Reservations[].Instances[].[InstanceType,CpuOptions.CoreCount,CpuOptions.ThreadsPerCore,Tags[?Key==`Project`]|[0].Value]' \
+    --output text 2>/dev/null \
+    | awk -v p="$NAME_PREFIX" '$1 ~ /^[acdhimrtz]/ && $4 != p {s += ($2=="None"?0:$2) * ($3=="None"?1:$3)} END {print s+0}')
 
   if [[ -z "$QUOTA" || "$QUOTA" == "None" ]]; then
     yellow "  Could not read the vCPU quota (needs servicequotas:GetServiceQuota)."
     yellow "  This deployment needs $NEED vCPUs; the default for a new account is 5."
   else
     QUOTA_INT=${QUOTA%.*}
-    printf '  need %s vCPUs (2 x %s + %s), in use %s, quota %s\n' \
-      "$NEED" "$INSTANCE_TYPE" \
-      "$([[ $WANT_WORKLOADS == true ]] && echo "2 x $WORKLOAD_TYPE" || echo "no workloads")" \
-      "$IN_USE" "$QUOTA_INT"
+    printf '  need %s vCPUs (%s), in use %s, quota %s\n' \
+      "$NEED" "$NEED_DESC" "$IN_USE" "$QUOTA_INT"
 
     if (( NEED + IN_USE > QUOTA_INT )); then
       red "  QUOTA TOO LOW. The apply will fail with VcpuLimitExceeded partway through."
@@ -258,7 +294,8 @@ else
       red "      --region $REGION --service-code ec2 --quota-code L-1216C47A"
       red ""
       red "  Note: an HA pair needs 2 x $INSTANCE_TYPE = $(( FW_VCPU * 2 )) vCPUs at minimum."
-      red "  Setting deploy_test_workloads = false saves $(( WL_VCPU * 2 )) but is not enough on its own."
+      red "  Setting deploy_test_workloads = false saves $(( WL_VCPU * WORKLOADS )) but is not enough on its own."
+      [[ "$WANT_BRANCH" == "true" ]] && red "  Setting deploy_branch = false saves the branch firewall's ${BR_VCPU:-?} vCPUs."
       die "Insufficient vCPU quota."
     fi
     green "  vCPU quota is sufficient"
@@ -291,6 +328,10 @@ if [[ $LICENSE_TYPE == byol ]]; then
   AUTH_CODE=$(sed -nE 's/^[[:space:]]*panos_auth_codes[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$TFVARS" | tail -1)
   [[ -n $AUTH_CODE && $AUTH_CODE != YOUR-AUTH-CODE ]] \
     || die "license_type is byol but panos_auth_codes is not set in $TFVARS -- add your auth code and re-run"
+  if [[ $WANT_BRANCH == true ]] && ! grep -qE '^[[:space:]]*branch_auth_codes[[:space:]]*=[[:space:]]*"[^"]+"' "$TFVARS"; then
+    yellow "  NOTE: no branch_auth_codes set; the branch firewall reuses panos_auth_codes,"
+    yellow "        so that code must cover THREE instances (the pair plus the branch)."
+  fi
 fi
 
 # Say it out loud. An open management plane is a legitimate choice for a
@@ -323,7 +364,12 @@ fi
 if [[ $AUTO_APPROVE -eq 0 ]]; then
   echo
   yellow "About to create a VM-Series HA pair in $REGION of account $ACCOUNT."
-  yellow "Two $INSTANCE_TYPE firewalls plus EIPs; this costs real money per hour."
+  if [[ "$WANT_BRANCH" == "true" ]]; then
+    yellow "Plus a branch VPC with a third firewall ($BRANCH_TYPE) and an IPsec tunnel."
+    yellow "Three firewalls plus EIPs; this costs real money per hour."
+  else
+    yellow "Two $INSTANCE_TYPE firewalls plus EIPs; this costs real money per hour."
+  fi
   read -r -p "Type 'yes' to continue: " REPLY
   [[ "$REPLY" == "yes" ]] || { echo "Aborted."; exit 1; }
 fi
@@ -370,6 +416,10 @@ cat <<'EOT'
 
   Test failover (run it again to fail back):
     python3 scripts/configure.py --failover-test
+
+  Branch site (if deployed): from a pair workload, reach the branch over IPsec:
+    curl -s http://<branch_workload_private_ip>/ip
+  The pre-shared key is in .secrets/ipsec_psk.
 
   After changing policy on the active firewall, copy it to the passive one:
     python3 scripts/configure.py --sync-config
