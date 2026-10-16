@@ -295,8 +295,9 @@ already right.
 
 ## Design decisions
 
-Notes 1 to 6 were each tested on a live pair (PAN-OS 11.1.13-h12, VM-Series
-plugin 5.1.11). The project now deploys PAN-OS 11.2.15 (`panos_version_filter`). Several replace earlier assumptions that turned out to be
+Every note was verified on a live deployment of PAN-OS 11.2.15, the version
+this project deploys (`panos_version_filter`), including failover tests in
+both directions. Several replace earlier assumptions that turned out to be
 wrong, so they are worth knowing before you change anything.
 
 ### HA pair
