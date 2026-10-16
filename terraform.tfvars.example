@@ -1,0 +1,97 @@
+###############################################################################
+# Copy to terraform.tfvars and edit. deploy.sh generates a minimal one for you
+# on first run if this file has not been copied.
+###############################################################################
+
+region             = "us-east-2"
+availability_zones = ["us-east-2a", "us-east-2b"]
+name_prefix        = "panw-ha"
+
+# ---------------------------------------------------------------------------
+# Who may reach the firewall management interfaces. Both lists feed the AWS
+# security group AND the firewall's own PAN-OS permitted-ip list.
+#
+# mgmt_allowed_cidrs: HTTPS + SSH. deploy.sh writes your detected public IP.
+# ["0.0.0.0/0"] is accepted (it removes the permitted-ip list entirely) but
+# opens management to the internet; account auto-remediation may revert it.
+# ---------------------------------------------------------------------------
+mgmt_allowed_cidrs = ["203.0.113.10/32"]
+
+# All traffic to the management interfaces ("Admin Workstation" rule).
+# Defaults to ["0.0.0.0/1", "128.0.0.0/1"] (all of IPv4); narrow it, e.g.:
+# admin_workstation_cidrs = ["203.0.113.10/32"]
+
+# ---------------------------------------------------------------------------
+# Licensing
+#
+#   byol    - uses the auth code in panos_auth_codes below (required)
+#   bundle1 - hourly PAYG, Threat Prevention only
+#   bundle2 - hourly PAYG, Threat + WildFire + URL + GlobalProtect + DNS
+#
+# This account is already subscribed to the BYOL listing; deploy.sh verifies
+# that with a RunInstances dry-run before planning.
+# ---------------------------------------------------------------------------
+license_type = "byol"
+
+# BYOL auth code from the Palo Alto CSP. Required when license_type = "byol";
+# keep it here (terraform.tfvars is git-ignored), not in variables.tf.
+panos_auth_codes = "YOUR-AUTH-CODE"
+
+# ---------------------------------------------------------------------------
+# Image and sizing
+# ---------------------------------------------------------------------------
+# Keep panos_config_version aligned with the major.minor you pin here, or
+# PAN-OS will reject bootstrap.xml on load.
+panos_version_filter = "PA-VM-AWS-11.1*"
+panos_config_version = "11.1.0"
+# Must be at least as large as the VM-Series model the auth code licenses, or
+# PAN-OS refuses the license and never finishes booting.
+instance_type        = "m5.4xlarge"
+root_volume_size     = 60
+
+# Pin an exact AMI instead of the Marketplace lookup:
+# ami_id = "ami-051d766b3ab7bc0dd"
+
+# ---------------------------------------------------------------------------
+# PAN-OS admin
+# ---------------------------------------------------------------------------
+admin_username = "pandmin"
+# Leave unset to have a strong password generated into ./.secrets/admin_password
+# admin_password = ""
+
+ha_group_id = 10
+timezone    = "US/Eastern"
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+vpc_cidr = "10.100.0.0/16"
+
+# /24 offsets within vpc_cidr, [AZ-A, AZ-B].
+# subnet_offsets = {
+#   mgmt     = [0, 10]
+#   ha2      = [1, 11]
+#   untrust  = [2, 12]
+#   trust    = [3, 13]
+#   workload = [20, 21]
+# }
+
+# ---------------------------------------------------------------------------
+# Inbound publishing through the floating IP. scripts/configure.py creates
+# the DNAT + security rules and syncs them to the passive firewall. Defaults
+# publish the test web server on the first workload: http://<floating IP>/
+# ---------------------------------------------------------------------------
+enable_inbound_dnat = true
+inbound_target_ip   = ""             # empty = first test workload
+inbound_service     = "service-http" # PAN-OS service object (TCP 80)
+
+# ---------------------------------------------------------------------------
+# Test workloads (one per AZ, reachable via SSM Session Manager)
+# ---------------------------------------------------------------------------
+deploy_test_workloads  = true
+workload_instance_type = "t3.micro"
+
+tags = {
+  Owner       = "network-security"
+  Environment = "lab"
+}

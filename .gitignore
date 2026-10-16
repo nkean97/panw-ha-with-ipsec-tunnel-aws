@@ -1,0 +1,21 @@
+# Secrets: PAN-OS admin password and SSH private key
+.secrets/
+
+# Rendered bootstrap configs (contain the admin password hash)
+.rendered/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+tfplan
+*.tfplan
+
+# Contains auth codes and your management CIDRs
+terraform.tfvars
+crash.log
+__pycache__/
+
+# macOS Finder metadata
+.DS_Store

@@ -1,0 +1,346 @@
+<?xml version="1.0"?>
+<!--
+  PAN-OS bootstrap configuration - ${hostname}
+
+  Interface map (AWS ENI device index -> PAN-OS interface):
+    eth0 -> management   : HA1 control link + admin/API access
+    eth1 -> ethernet1/1  : HA2 state-sync link (static IP, type "ha")
+    eth2 -> ethernet1/2  : untrust / internet side (DHCP from AWS)
+    eth3 -> ethernet1/3  : trust / inside   (DHCP from AWS)
+
+  Dataplane interfaces use the AWS DHCP server so the PAN-OS address always
+  matches whatever the ENI was assigned. create-default-route is "no" on both
+  because the virtual router carries explicit static routes instead.
+-->
+<config version="${config_version}" urldb="paloaltonetworks">
+  <mgt-config>
+    <users>
+      <entry name="${admin_username}">
+        <phash>${admin_phash}</phash>
+        <permissions>
+          <role-based>
+            <superuser>yes</superuser>
+          </role-based>
+        </permissions>
+      </entry>
+%{ if admin_username != "admin" ~}
+      <!--
+        Keep the AMI's key-only "admin" account. The <users> block replaces the
+        default user list, so without this entry a phash PAN-OS cannot use
+        leaves no working login at all. <public-key> is the base64 of the
+        OpenSSH public key line for the deployment key pair.
+      -->
+      <entry name="admin">
+        <public-key>${admin_public_key}</public-key>
+        <permissions>
+          <role-based>
+            <superuser>yes</superuser>
+          </role-based>
+        </permissions>
+      </entry>
+%{ endif ~}
+    </users>
+  </mgt-config>
+  <shared/>
+  <devices>
+    <entry name="localhost.localdomain">
+      <deviceconfig>
+        <system>
+          <hostname>${hostname}</hostname>
+          <timezone>${timezone}</timezone>
+          <type>
+            <dhcp-client>
+              <send-hostname>yes</send-hostname>
+              <send-client-id>yes</send-client-id>
+              <accept-dhcp-hostname>no</accept-dhcp-hostname>
+              <accept-dhcp-domain>yes</accept-dhcp-domain>
+            </dhcp-client>
+          </type>
+          <dns-setting>
+            <servers>
+              <!-- AmazonProvidedDNS at the VPC base +2, reachable via link-local -->
+              <primary>169.254.169.253</primary>
+              <secondary>1.1.1.1</secondary>
+            </servers>
+          </dns-setting>
+          <ntp-servers>
+            <primary-ntp-server>
+              <ntp-server-address>169.254.169.123</ntp-server-address>
+            </primary-ntp-server>
+            <secondary-ntp-server>
+              <ntp-server-address>time.google.com</ntp-server-address>
+            </secondary-ntp-server>
+          </ntp-servers>
+          <update-server>updates.paloaltonetworks.com</update-server>
+          <server-verification>yes</server-verification>
+          <service>
+            <disable-telnet>yes</disable-telnet>
+            <disable-http>yes</disable-http>
+          </service>
+%{ if length(permitted_ips) > 0 ~}
+          <permitted-ip>
+%{ for cidr in permitted_ips ~}
+            <entry name="${cidr}"/>
+%{ endfor ~}
+          </permitted-ip>
+%{ endif ~}
+        </system>
+
+        <!--
+          High Availability - Active/Passive across two AZs.
+
+          HA1 (control) rides the management interface and peers with the other
+          node's management IP. HA2 (state sync) uses the dedicated ethernet1/1
+          interface with transport "udp" (port 29281): the two HA2 interfaces
+          sit in different AZ subnets, so the link is ROUTED, and UDP traverses
+          VPC security groups cleanly where IP protocol 99 is awkward.
+
+          device-priority: lower value wins the election.
+            fw-a = 50 (active), fw-b = 100 (passive)
+        -->
+        <high-availability>
+          <enabled>yes</enabled>
+          <interface>
+            <ha1>
+              <port>management</port>
+            </ha1>
+            <ha2>
+              <port>ethernet1/1</port>
+              <ip-address>${ha2_ip}</ip-address>
+              <netmask>${ha2_netmask}</netmask>
+              <gateway>${ha2_gateway}</gateway>
+            </ha2>
+          </interface>
+          <group>
+            <group-id>${ha_group_id}</group-id>
+            <peer-ip>${peer_mgmt_ip}</peer-ip>
+            <!-- No passive-link-state or ha2-keep-alive action: VM-Series
+                 accepts both at bootstrap load but rejects them at commit
+                 validation, which then blocks every later commit. -->
+            <mode>
+              <active-passive/>
+            </mode>
+            <election-option>
+              <device-priority>${device_priority}</device-priority>
+              <!-- No preemption. With it on, fw-a reclaimed active ~60 s after
+                   returning while fw-b's AWS plugin was still repointing routes
+                   and the EIP, and the two nodes traded them back and forth.
+                   Failback is a deliberate step instead (run the failover test
+                   again, or suspend the active node). -->
+              <preemptive>no</preemptive>
+              <timers>
+                <recommended/>
+              </timers>
+            </election-option>
+            <state-synchronization>
+              <enabled>yes</enabled>
+              <transport>udp</transport>
+              <ha2-keep-alive>
+                <enabled>yes</enabled>
+              </ha2-keep-alive>
+            </state-synchronization>
+            <!-- Config sync off. The nodes sit in different AZs, so their
+                 virtual-router next hops (each subnet's .1) differ; sync copies
+                 the active node's routes onto the peer, which then cannot
+                 forward after a failover. Session sync (HA2) stays on. Make
+                 policy changes on both nodes. -->
+            <configuration-synchronization>
+              <enabled>no</enabled>
+            </configuration-synchronization>
+          </group>
+        </high-availability>
+      </deviceconfig>
+
+      <network>
+        <interface>
+          <ethernet>
+            <!-- eth1: dedicated HA2 state-sync link -->
+            <entry name="ethernet1/1">
+              <ha/>
+            </entry>
+            <!-- eth2: untrust -->
+            <entry name="ethernet1/2">
+              <layer3>
+                <dhcp-client>
+                  <enable>yes</enable>
+                  <create-default-route>no</create-default-route>
+                </dhcp-client>
+                <interface-management-profile>mgmt-ping</interface-management-profile>
+              </layer3>
+            </entry>
+            <!-- eth3: trust -->
+            <entry name="ethernet1/3">
+              <layer3>
+                <dhcp-client>
+                  <enable>yes</enable>
+                  <create-default-route>no</create-default-route>
+                </dhcp-client>
+                <interface-management-profile>mgmt-ping</interface-management-profile>
+              </layer3>
+            </entry>
+          </ethernet>
+        </interface>
+
+        <profiles>
+          <interface-management-profile>
+            <!-- Ping only: lets you verify reachability of the dataplane legs
+                 without exposing the management services on them. -->
+            <entry name="mgmt-ping">
+              <ping>yes</ping>
+            </entry>
+          </interface-management-profile>
+        </profiles>
+
+        <virtual-router>
+          <entry name="default">
+            <interface>
+              <member>ethernet1/2</member>
+              <member>ethernet1/3</member>
+            </interface>
+            <routing-table>
+              <ip>
+                <static-route>
+                  <!-- Internet via the untrust subnet's AWS router -->
+                  <entry name="default">
+                    <destination>0.0.0.0/0</destination>
+                    <interface>ethernet1/2</interface>
+                    <nexthop>
+                      <ip-address>${untrust_gateway}</ip-address>
+                    </nexthop>
+                    <metric>10</metric>
+                  </entry>
+                  <!-- Everything inside the VPC (workloads, return traffic,
+                       east-west) via the trust subnet's AWS router -->
+                  <entry name="vpc-inside">
+                    <destination>${vpc_cidr}</destination>
+                    <interface>ethernet1/3</interface>
+                    <nexthop>
+                      <ip-address>${trust_gateway}</ip-address>
+                    </nexthop>
+                    <metric>10</metric>
+                  </entry>
+                </static-route>
+              </ip>
+            </routing-table>
+          </entry>
+        </virtual-router>
+      </network>
+
+      <vsys>
+        <entry name="vsys1">
+          <import>
+            <network>
+              <interface>
+                <member>ethernet1/2</member>
+                <member>ethernet1/3</member>
+              </interface>
+            </network>
+          </import>
+
+          <zone>
+            <entry name="untrust">
+              <network>
+                <layer3>
+                  <member>ethernet1/2</member>
+                </layer3>
+              </network>
+            </entry>
+            <entry name="trust">
+              <network>
+                <layer3>
+                  <member>ethernet1/3</member>
+                </layer3>
+              </network>
+            </entry>
+          </zone>
+
+          <!-- Inbound publishing (DNAT from the floating IP to a workload) is
+               not here: its target IP only exists after the workloads are
+               built, which is after the firewalls boot. scripts/configure.py
+               adds it and syncs it to the peer.
+
+               Every rule carries a uuid. The bootstrap loader accepts rules
+               without one, but commit validation fails with "no UUID found for
+               rule". uuidv5 keeps them stable across plans and identical on
+               both peers, which HA config sync expects. -->
+          <rulebase>
+            <nat>
+              <rules>
+                <!-- Outbound egress: source-NAT workload traffic to the
+                     untrust interface address, which the IGW then maps to the
+                     untrust EIP. -->
+                <entry name="outbound-snat" uuid="${uuidv5("url", "urn:panw-ha:nat:outbound-snat")}">
+                  <description>Egress inspection: SNAT trust -> untrust</description>
+                  <from><member>trust</member></from>
+                  <to><member>untrust</member></to>
+                  <source><member>any</member></source>
+                  <destination><member>any</member></destination>
+                  <service>any</service>
+                  <to-interface>ethernet1/2</to-interface>
+                  <source-translation>
+                    <dynamic-ip-and-port>
+                      <interface-address>
+                        <interface>ethernet1/2</interface>
+                      </interface-address>
+                    </dynamic-ip-and-port>
+                  </source-translation>
+                </entry>
+              </rules>
+            </nat>
+
+            <security>
+              <rules>
+                <!-- 1. Outbound egress inspection -->
+                <entry name="allow-outbound" uuid="${uuidv5("url", "urn:panw-ha:security:allow-outbound")}">
+                  <description>Workload egress to the internet</description>
+                  <from><member>trust</member></from>
+                  <to><member>untrust</member></to>
+                  <source><member>any</member></source>
+                  <destination><member>any</member></destination>
+                  <source-user><member>any</member></source-user>
+                  <application><member>any</member></application>
+                  <service><member>any</member></service>
+                  <category><member>any</member></category>
+                  <action>allow</action>
+                  <log-start>no</log-start>
+                  <log-end>yes</log-end>
+                </entry>
+
+                <!-- 2. East-west between workload subnets. Both legs arrive and
+                     leave on ethernet1/3, so this is intrazone trust -> trust. -->
+                <entry name="allow-east-west" uuid="${uuidv5("url", "urn:panw-ha:security:allow-east-west")}">
+                  <description>Inspected VPC east-west traffic</description>
+                  <from><member>trust</member></from>
+                  <to><member>trust</member></to>
+                  <source><member>any</member></source>
+                  <destination><member>any</member></destination>
+                  <source-user><member>any</member></source-user>
+                  <application><member>any</member></application>
+                  <service><member>any</member></service>
+                  <category><member>any</member></category>
+                  <action>allow</action>
+                  <log-end>yes</log-end>
+                </entry>
+
+                <!-- 4. Explicit clean-up rule so denies are logged. -->
+                <entry name="deny-all" uuid="${uuidv5("url", "urn:panw-ha:security:deny-all")}">
+                  <description>Default deny with logging</description>
+                  <from><member>any</member></from>
+                  <to><member>any</member></to>
+                  <source><member>any</member></source>
+                  <destination><member>any</member></destination>
+                  <source-user><member>any</member></source-user>
+                  <application><member>any</member></application>
+                  <service><member>any</member></service>
+                  <category><member>any</member></category>
+                  <action>deny</action>
+                  <log-end>yes</log-end>
+                </entry>
+              </rules>
+            </security>
+          </rulebase>
+        </entry>
+      </vsys>
+    </entry>
+  </devices>
+</config>
